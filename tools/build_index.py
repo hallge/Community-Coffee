@@ -106,6 +106,9 @@ def load_observations(root, accept_unsigned=False, log=print):
             "unit": grinder["unit"],
             "um_per_unit": grinder.get("um_per_unit", 0) or 0,
             "model_id": grinder.get("model_id", 0) or 0,
+            # The same model, for comparing owners of one: the library's entry if it has
+            # one, else the firmware's own number for it.
+            "model_key": grinder.get("library_id") or (grinder.get("model_id", 0) or 0),
             "item": (library_id, recipe_class(body["recipe"])),
             "setting": float(body["grind"]),
             "time_s": float(body["result"]["time_s"]),
@@ -211,6 +214,22 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
             log(f"catalog entry ignored: {path}: {error}")
     write(os.path.join(out, "coffees.json"), {"v": 1, "coffees": coffees})
 
+    # Grinder models reviewers have listed.
+    listed = []
+    for path in sorted(glob.glob(os.path.join(root, "grinders", "*.json"))):
+        try:
+            entry = read_json(path)
+            vr._text(entry, "model", 31)
+            vr._text(entry, "unit", 7)
+            vr._text(entry, "burrs", 23, required=False)
+            vr._number(entry, "um_per_unit", 0.01, 1000, required=False)
+            if not library_file(entry.get("id")) or "/" in entry["id"]:
+                raise vr.Refused("id is not a plain lower-case name")
+            listed.append({k: entry[k] for k in ("id", "model", "burrs", "unit", "um_per_unit") if k in entry})
+        except (vr.Refused, ValueError, OSError, AttributeError, TypeError) as error:
+            log(f"grinder entry ignored: {path}: {error}")
+    write(os.path.join(out, "grinders.json"), {"v": 1, "grinders": listed})
+
     # What was settled on, per coffee.
     per_coffee = {}
     for item, ps in by_item.items():
@@ -223,8 +242,8 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
                      for p in ps if p["instance"] in scale]
         models = {}
         for p in ps:
-            if p["model_id"]:
-                models.setdefault((p["model_id"], p["unit"]), {})[p["kid"]] = p["setting"]
+            if p.get("model_key"):
+                models.setdefault((p["model_key"], p["unit"]), {})[p["kid"]] = p["setting"]
         library_id, (dose, yield_g) = item
         per_coffee.setdefault(library_id, []).append({
             "dose_g": dose, "yield_g": yield_g,
@@ -233,8 +252,9 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
             "time_s": round(statistics.median(p["time_s"] for p in ps), 1),
             "fineness_um": round(fineness[item], 1),
             "spread_um": round(1.4826 * statistics.median(residuals), 1) if len(residuals) > 1 else 0,
-            "models": [{"model_id": m, "unit": u, "median": round(statistics.median(v.values()), 1),
-                        "n": len(v)} for (m, u), v in sorted(models.items())],
+            "models": [dict({"library_id": m} if isinstance(m, str) else {"model_id": m}, unit=u,
+                            median=round(statistics.median(v.values()), 1), n=len(v))
+                       for (m, u), v in sorted(models.items(), key=lambda kv: (str(kv[0][0]), kv[0][1]))],
         })
     for library_id, recipes in per_coffee.items():
         write(os.path.join(out, "dialin", library_file(library_id) + ".json"),
@@ -346,7 +366,7 @@ def self_test():
         for coffee, f in truth.items():
             if (who, coffee) in (("b", "k5"), ("d", "k4")):
                 continue    # held back
-            points.append({"kid": who, "instance": (who, 0), "unit": "u", "model_id": 0,
+            points.append({"kid": who, "instance": (who, 0), "unit": "u", "model_id": 0, "model_key": 0,
                            "um_per_unit": 1 / a if marked else 0, "item": (coffee, (18.0, 36)),
                            "setting": a * f + b, "time_s": 26.0, "count": 1})
     fineness, scale, offset = fit(points)

@@ -81,7 +81,7 @@ def ecdsa_verify(public, digest, r, s):
 
 
 # ---- records ----------------------------------------------------------------
-TYPES = ("key", "coffee", "dialin", "shot")
+TYPES = ("key", "coffee", "grinder", "dialin", "shot")
 KEY_ID_HEX = 20
 
 
@@ -155,6 +155,7 @@ def check_grinder(g):
     _text(g, "model", 31, required=False)
     _text(g, "burrs", 23, required=False)
     _number(g, "model_id", 1, 65535, required=False)
+    _text(g, "library_id", 39, required=False)
     _number(g, "um_per_unit", 0.01, 1000, required=False)
     _number(g, "calibration", 0, 65535)
 
@@ -168,6 +169,14 @@ def check_body(body):
     if kind == "coffee":
         check_coffee(body)
         _number(body, "record", 0, 4294967295)   # which version of it this is, by the sender's count
+    elif kind == "grinder":
+        # A grinder model described by its owner, for a reviewer.
+        _text(body, "model", 31)
+        _text(body, "burrs", 23, required=False)
+        _text(body, "unit", 7)
+        _number(body, "um_per_unit", 0.01, 1000, required=False)
+        _number(body, "local_id", 1, 65535)
+        _number(body, "record", 0, 4294967295)
     elif kind == "dialin":
         check_coffee(body.get("coffee") or {})
         check_recipe(body.get("recipe") or {})
@@ -304,6 +313,9 @@ def self_test():
     assert "not ES256" in refused(envelope(coffee, alg="EMULATOR-UNSIGNED"))
     assert "fingerprint" in refused(envelope(key_body, who="0" * 20), {})
     assert "outside" in refused(envelope(dialin.replace('"dose_g":18', '"dose_g":180')))
+    grinder = '{"t":"grinder","v":1,"record":3,"local_id":2,"model":"Home Built 64","unit":"dial"}'
+    assert verify(envelope(grinder), keys)[0] == "grinder"
+    assert "unit is missing" in refused(envelope(grinder.replace(',"unit":"dial"', "")))
     assert "unknown record type" in refused(envelope('{"t":"other","v":1}'))
     assert "missing" in refused(envelope('{"t":"coffee","v":1,"local_id":4,"record":7}'))
     assert "record is missing" in refused(envelope(coffee.replace('"record":7,', '')))

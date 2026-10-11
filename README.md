@@ -21,6 +21,8 @@ main: Intake   checks every record:
                  coffee    -> pending/, and a pull request that would add it
                               to catalog/. The contributor's status file
                               says "review".
+                 grinder   -> the same, for grinders/: a model its owner
+                              typed in, offered for the shared list
                fails -> left out, listed with the reason in the run's summary
                then: index rebuilt, inbox emptied
 reviewer       merges the pull request (publish) or closes it (decline)
@@ -46,17 +48,28 @@ entries already in the catalog.
 - **Decline:** close it. If the last comment starts with `Declined:`, the
   rest of that line (47 characters) is shown to the contributor.
 
+## Reviewing a grinder
+
+A pull request titled "Add grinder: model" proposes a grinder model for the
+shared list, so that the next owner of one picks it instead of typing it,
+and settings can be compared among everyone who has it. Check the name, and
+what a setting is read in (`unit`). Keep `um_per_unit` (microns of burr gap
+per unit) only if the maker publishes it; left out, the index works the
+scale out from shared shots. Merge to list it, close to decline, as for a
+coffee.
+
 ## Folders
 
 | Folder | What | Written by |
 | --- | --- | --- |
 | `catalog/<roaster>/<coffee>.json` | Published coffees | Reviewers, by merging |
+| `grinders/<model>.json` | Grinder models reviewers have listed | Reviewers, by merging |
 | `keys/<key id>.json` | Contributors' public keys | Intake |
 | `dialins/<yyyy>/<mm>/` | Settled dial-ins | Intake |
 | `shots/<yyyy>/<mm>/` | Shots, where an owner shares them | Intake |
-| `pending/coffees/<key id>/` | Coffees waiting for review | Intake |
-| `status/<key id>.json` | Where each contributor's coffees stand | Intake, Review outcome |
-| `index/` | What controllers read: coffee list, community figures, grinder fits | Built, never edited |
+| `pending/coffees/<key id>/`, `pending/grinders/<key id>/` | Coffees and grinders waiting for review | Intake |
+| `status/<key id>.json` | Where each contributor's coffees and grinders stand | Intake, Review outcome |
+| `index/` | What controllers read: coffee list, grinder list, community figures, grinder fits | Built, never edited |
 | `tools/` | The checks and builders the workflows run | By hand |
 
 ## The tools
@@ -109,3 +122,5 @@ What the library tells a controller, `status/<key id>.json`:
 
 `record` is the number the controller gave that version of the coffee (it is
 inside the signed record). A verdict only counts for the version last sent.
+A `grinders` list in the same file does the same for grinders a contributor
+has sent.

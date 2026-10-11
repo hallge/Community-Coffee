@@ -35,7 +35,7 @@ def open_reviews(plan_path):
     opened = 0
     for item in plan:
         branch = item["branch"]
-        if not re.fullmatch(r"review/[0-9a-f]{20}-c\d+-\d+", branch):
+        if not re.fullmatch(r"review/[0-9a-f]{20}-[cg]\d+-\d+", branch):
             print(f"skipped: not a review branch name: {branch!r}")
             continue
         if run("git", "ls-remote", "--exit-code", "--heads", "origin", branch, check=False, capture=True):
@@ -74,12 +74,14 @@ def decision(body, merged, comments, files, read_catalog):
         return None
     if not re.fullmatch(r"[0-9a-f]{20}", str(kid)):
         return None
-    result = {"kid": kid, "local_id": local_id, "record": record}
+    kind = "grinder" if meta.get("kind") == "grinder" else "coffee"
+    folder = "grinders/" if kind == "grinder" else "catalog/"
+    result = {"kind": kind, "kid": kid, "local_id": local_id, "record": record}
     if merged:
         # The reviewer may have renamed the entry: go by what was merged.
         library_id = ""
         for path in files:
-            if path.startswith("catalog/") and path.endswith(".json"):
+            if path.startswith(folder) and path.endswith(".json"):
                 entry = read_catalog(path)
                 if isinstance(entry, dict) and build_index.library_file(entry.get("id")):
                     library_id = entry["id"]
@@ -107,12 +109,15 @@ def close_review():
     if result is None:
         print("not a review pull request, or nothing was published: status left alone")
         return
+    grinder = result["kind"] == "grinder"
     changed = intake.set_status(".", result["kid"], result["local_id"], result["record"],
-                                result["state"], result["library_id"], result["note"])
-    pending = f"pending/coffees/{result['kid']}/c{result['local_id']}-{result['record']}.json"
+                                result["state"], result["library_id"], result["note"],
+                                "grinders" if grinder else "coffees")
+    pending = (f"pending/grinders/{result['kid']}/g{result['local_id']}-{result['record']}.json" if grinder
+               else f"pending/coffees/{result['kid']}/c{result['local_id']}-{result['record']}.json")
     if os.path.exists(pending):
         os.remove(pending)   # decided either way: no longer waiting
-    print(f"{result['state']}: key {result['kid']} coffee {result['local_id']} record {result['record']}"
+    print(f"{result['state']}: key {result['kid']} {result['kind']} {result['local_id']} record {result['record']}"
           + ("" if changed else " (a newer version has been sent since: status left alone)"))
 
 
@@ -120,7 +125,7 @@ def self_test():
     body = 'text\n<!-- intake {"kid":"0123456789abcdef0123","local_id":4,"record":7,"library_id":"a/b"} -->'
     catalog = {"catalog/portrait/idjwi-island.json": {"id": "portrait/idjwi-island", "name": "Idjwi Island"}}
     merged = decision(body, True, [], ["catalog/portrait/idjwi-island.json", "pending/x.json"], catalog.get)
-    assert merged == {"kid": "0123456789abcdef0123", "local_id": 4, "record": 7, "state": "published",
+    assert merged == {"kind": "coffee", "kid": "0123456789abcdef0123", "local_id": 4, "record": 7, "state": "published",
                       "library_id": "portrait/idjwi-island", "note": ""}       # the merged file's id, not the proposal's
     assert decision(body, True, [], ["README.md"], catalog.get) is None
     closed = decision(body, False, ["looks odd", "Declined: already listed as portrait/idjwi\nmore", "ok"],
@@ -128,6 +133,11 @@ def self_test():
     assert closed["state"] == "declined" and closed["note"] == "already listed as portrait/idjwi"
     assert decision(body, False, [], [], catalog.get)["note"] == "Not accepted by a reviewer"
     assert decision("an ordinary pull request", True, [], [], catalog.get) is None
+    gbody = '<!-- intake {"kind":"grinder","kid":"0123456789abcdef0123","local_id":2,"record":11} -->'
+    listed = {"grinders/home-built-64.json": {"id": "home-built-64", "model": "Home Built 64", "unit": "dial"}}
+    g = decision(gbody, True, [], ["grinders/home-built-64.json"], listed.get)
+    assert g["kind"] == "grinder" and g["library_id"] == "home-built-64" and g["state"] == "published"
+    assert decision(gbody, True, [], ["catalog/portrait/idjwi-island.json"], catalog.get) is None   # wrong folder
     assert decision(body.replace("0123456789abcdef0123", "../../etc"), True, [], [], catalog.get) is None
     assert decision('<!-- intake {"kid":1} -->', False, [], [], catalog.get) is None
     bad = {'catalog/x.json': {'id': '../../etc/passwd'}}

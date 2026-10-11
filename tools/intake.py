@@ -46,6 +46,7 @@ import verify_record as vr  # noqa: E402
 
 CATALOG_FIELDS = ("name", "roaster", "origin", "region", "producer", "varietal", "process",
                   "roast_level", "altitude_m", "notes")
+GRINDER_FIELDS = ("model", "burrs", "unit", "um_per_unit")
 NOTE_LIMIT = 47     # what the controller keeps of a reviewer's note
 MAX_RECORD_BYTES = 8192
 
@@ -77,11 +78,13 @@ def write_text(path, text):
         f.write(text)
 
 
-def set_status(library, kid, local_id, record, state, library_id="", note=""):
-    """One line per coffee in status/<kid>.json; a newer record replaces an older one's line."""
+def set_status(library, kid, local_id, record, state, library_id="", note="", section="coffees"):
+    """One line per coffee (or grinder) in status/<kid>.json; a newer record replaces an older one's line."""
     path = os.path.join(library, "status", kid + ".json")
     status = read_json(path, {}) or {}
-    entries = [e for e in status.get("coffees", []) if isinstance(e, dict)]
+    if not isinstance(status, dict):
+        status = {}
+    entries = [e for e in status.get(section, []) if isinstance(e, dict)]
     current = next((e for e in entries if e.get("local_id") == local_id), None)
     if current and current.get("record", -1) > record:
         return False    # the contributor has sent a newer version since
@@ -93,7 +96,10 @@ def set_status(library, kid, local_id, record, state, library_id="", note=""):
         entry["note"] = note
     entries = [e for e in entries if e.get("local_id") != local_id] + [entry]
     entries.sort(key=lambda e: e.get("local_id", 0))
-    write_text(path, json.dumps({"v": 1, "coffees": entries}, separators=(",", ":")) + "\n")
+    status["v"] = 1
+    status.setdefault("coffees", [])
+    status[section] = entries
+    write_text(path, json.dumps(status, separators=(",", ":"), sort_keys=True) + "\n")
     return True
 
 
@@ -122,7 +128,7 @@ def pull_request_text(library, kid, body, proposed_id, exists):
     rows = "\n".join(f"| {field.replace('_', ' ')} | {body[field]} |" for field in CATALOG_FIELDS if field in body)
     similar = [s for s in similar_coffees(library, body) if s != proposed_id]
     history = contributor_history(library, kid)
-    meta = json.dumps({"kid": kid, "local_id": body["local_id"], "record": body["record"],
+    meta = json.dumps({"kind": "coffee", "kid": kid, "local_id": body["local_id"], "record": body["record"],
                        "library_id": proposed_id}, separators=(",", ":"))
     lines = [
         f"A controller has sent this coffee{' again, changed' if exists else ''}. Its record passed the "
@@ -144,6 +150,32 @@ def pull_request_text(library, kid, body, proposed_id, exists):
         f"<!-- intake {meta} -->",
     ]
     return "\n".join(lines)
+
+
+def grinder_request_text(library, kid, body, proposed_id, exists):
+    rows = "\n".join(f"| {field.replace('_', ' ')} | {body[field]} |" for field in GRINDER_FIELDS if field in body)
+    existing = sorted(os.path.splitext(os.path.basename(p))[0]
+                      for p in glob.glob(os.path.join(library, "grinders", "*.json")))
+    close = [e for e in difflib.get_close_matches(proposed_id, existing, n=5, cutoff=0.5) if e != proposed_id]
+    meta = json.dumps({"kind": "grinder", "kid": kid, "local_id": body["local_id"], "record": body["record"],
+                       "library_id": proposed_id}, separators=(",", ":"))
+    return "\n".join([
+        f"A controller's owner has described this grinder{' again, changed' if exists else ''}. Its record passed "
+        "the signature and value checks; whether the model belongs in the shared list, and whether the unit and "
+        "the microns per unit are right, is for a person to decide.",
+        "", "| | |", "| --- | --- |", rows, "",
+        f"**Would be listed as** `{proposed_id}`" + (" (this entry exists: merging replaces it)" if exists else ""),
+        "",
+        "`um per unit` is how many microns of burr gap one unit of the setting is. Leave it out unless the maker "
+        "publishes it: the index then learns the scale from shared shots.",
+        "",
+        "**Similar entries already listed:** " + (", ".join(f"`{s}`" for s in close) if close else "none found."),
+        "",
+        "- **Merge** to list it. Edit the file in this pull request first if anything needs correcting.",
+        f"- **Close** to decline. A last comment starting `Declined:` is shown to the contributor (first {NOTE_LIMIT} characters).",
+        "",
+        f"<!-- intake {meta} -->",
+    ])
 
 
 def take(inbox, library, log=print):
@@ -190,6 +222,27 @@ def take(inbox, library, log=print):
             target = f"shots/{month_folder(body)}/{kid}-{int(body['id'])}.json"
             write_text(os.path.join(library, target), text)
             report.append((shown, "filed", target))
+        elif kind == "grinder":   # a model for the shared list: reviewed, like a coffee
+            local_id, record = body["local_id"], body["record"]
+            pending = f"pending/grinders/{kid}/g{local_id}-{record}.json"
+            if not set_status(library, kid, local_id, record, "review", section="grinders"):
+                report.append((shown, "refused", "an earlier version of a grinder that has been sent again since"))
+                continue
+            write_text(os.path.join(library, pending), text)
+            proposed = slug(body["model"]) or "unnamed"
+            listed_path = f"grinders/{proposed}.json"
+            exists = os.path.exists(os.path.join(library, listed_path))
+            entry = {"id": proposed}
+            entry.update({field: body[field] for field in GRINDER_FIELDS if field in body})
+            plan.append({
+                "branch": f"review/{kid}-g{local_id}-{record}",
+                "title": f"{'Change' if exists else 'Add'} grinder: {body['model']}",
+                "body": grinder_request_text(library, kid, body, proposed, exists),
+                "catalog_path": listed_path,
+                "catalog_text": json.dumps(entry, indent=1) + "\n",
+                "pending_path": pending,
+            })
+            report.append((shown, "for review", listed_path))
         else:   # a coffee: never published from here
             local_id, record = body["local_id"], body["record"]
             pending = f"pending/coffees/{kid}/c{local_id}-{record}.json"
@@ -267,6 +320,8 @@ def self_test():
         drop("a/whatever.json", env(anna, coffee))
         drop("a/../a/d.json", env(anna, dialin))
         drop("keys/pretend.json", env(anna, shot))
+        drop("a/g.json", env(anna, {"t": "grinder", "v": 1, "record": 11, "local_id": 2,
+                                     "model": "Home Built 64", "burrs": "64 mm flat", "unit": "dial"}))
         # And things that must not get in.
         drop("bad/tampered.json", env(anna, dialin).replace("246", "146"))
         drop("bad/wrong-type.json", env(anna, dict(dialin, grind="fine")))
@@ -293,7 +348,14 @@ def self_test():
         assert os.path.exists(os.path.join(library, "pending", "coffees", anna[1], "c4-7.json"))
         assert not os.path.exists(os.path.join(library, "keys", ben[1] + ".json"))
         status = read_json(os.path.join(library, "status", anna[1] + ".json"))
-        assert status == {"v": 1, "coffees": [{"local_id": 4, "record": 7, "state": "review"}]}
+        assert status["coffees"] == [{"local_id": 4, "record": 7, "state": "review"}]
+        assert status["grinders"] == [{"local_id": 2, "record": 11, "state": "review"}]
+        assert outcome["a/g.json"] == ("for review", "grinders/home-built-64.json")
+        gplan = [p for p in plan if p["branch"].endswith("-g2-11")][0]
+        assert gplan["title"] == "Add grinder: Home Built 64" and '"kind":"grinder"' in gplan["body"]
+        assert json.loads(gplan["catalog_text"]) == {"id": "home-built-64", "model": "Home Built 64", "burrs": "64 mm flat", "unit": "dial"}
+        assert os.path.exists(os.path.join(library, "pending", "grinders", anna[1], "g2-11.json"))
+        plan = [p for p in plan if p is not gplan]
         assert len(plan) == 1 and plan[0]["branch"] == f"review/{anna[1]}-c4-7"
         assert plan[0]["title"] == "Add Portrait Coffee / Idjwi Island"
         entry = json.loads(plan[0]["catalog_text"])
@@ -308,6 +370,10 @@ def self_test():
 
         # The reviewer merges: published under the catalog's id.
         assert set_status(library, anna[1], 4, 7, "published", "portrait-coffee/idjwi-island")
+        assert set_status(library, anna[1], 2, 11, "published", "home-built-64", section="grinders")
+        both = read_json(os.path.join(library, "status", anna[1] + ".json"))
+        assert both["coffees"][0]["state"] == "published" and both["grinders"][0]["library_id"] == "home-built-64"
+        write_text(os.path.join(library, gplan["catalog_path"]), gplan["catalog_text"])
         write_text(os.path.join(library, plan[0]["catalog_path"]), plan[0]["catalog_text"])
         # A changed version arrives; a verdict on the old one comes too late to matter.
         write_text(os.path.join(root, "inbox2", "c.json"),
@@ -327,6 +393,8 @@ def self_test():
         built = read_json(os.path.join(library, "index", "dialin", "portrait-coffee__idjwi-island.json"))
         assert built["recipes"][0]["fineness_um"] == 246.0
         assert read_json(os.path.join(library, "index", "coffees.json"))["coffees"][0]["id"] == "portrait-coffee/idjwi-island"
+        assert read_json(os.path.join(library, "index", "grinders.json"))["grinders"] == [
+            {"id": "home-built-64", "model": "Home Built 64", "burrs": "64 mm flat", "unit": "dial"}]
     assert slug("Café  Olé!") == "caf-ol" and catalog_id({"name": "X"}) == "unknown/x"
     print("self-test passed")
 
@@ -348,6 +416,7 @@ def main():
     r.add_argument("--state", choices=("published", "declined"), required=True)
     r.add_argument("--library-id", default="")
     r.add_argument("--note", default="")
+    r.add_argument("--section", choices=("coffees", "grinders"), default="coffees")
     args = parser.parse_args()
     if args.self_test:
         self_test()
@@ -363,7 +432,7 @@ def main():
             parser.error("not a key id")
         note = re.sub(r"^\s*declined:\s*", "", args.note, flags=re.IGNORECASE)
         changed = set_status(args.library, args.kid, args.local_id, args.record, args.state,
-                             args.library_id if args.state == "published" else "", note)
+                             args.library_id if args.state == "published" else "", note, args.section)
         print("status updated" if changed else "left alone: the contributor has sent a newer version")
     else:
         parser.error("give a command, or --self-test")
