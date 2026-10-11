@@ -1,0 +1,21 @@
+# This branch is where controllers push their records (under inbox/).
+# All this does is ask main's Intake workflow to come and look. The checking
+# itself runs from main, where nothing pushed here can change it.
+name: Something arrived
+
+on:
+  push:
+    branches: [inbox]
+    paths: ["inbox/**"]
+
+permissions:
+  actions: write
+
+jobs:
+  poke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask main to take it in
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run intake.yml --repo "$GITHUB_REPOSITORY" --ref main
