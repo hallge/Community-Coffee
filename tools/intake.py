@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Take in what controllers have sent: check every record, file the good
+ones, and put coffees up for review.
+
+    python tools/intake.py take --inbox <folder> --library <folder> [--plan plan.json] [--summary file.md]
+    python tools/intake.py resolve --library <folder> --kid K --local-id N --record R
+                                   --state published|declined [--library-id ID] [--note TEXT]
+    python tools/intake.py --self-test
+
+Controllers push signed records into the inbox. Nothing there is trusted:
+not the file names, not the folders, only what passes the checks in
+tools/verify_record.py:
+
+  1. the envelope is well formed;
+  2. the signature is right for the body, with a key on file (records are
+     signed, not encrypted: anyone can read one, nobody can alter one);
+  3. every value is of the expected type and inside the range the firmware
+     allows.
+
+What happens to a record that passes depends on what it is:
+
+  key      filed under keys/. A key says nothing by itself.
+  dial-in  filed under dialins/. A measurement: checked, not reviewed.
+  shot     filed under shots/. The same.
+  coffee   NOT published. It is parked under pending/, the contributor's
+           status file says "review", and the plan lists a pull request to
+           open that would add it to catalog/. A person decides.
+
+A record that fails is left out and listed, with the reason, in the summary.
+
+`take` changes only files under the library folder and writes the plan; the
+workflow does the committing and opens the pull requests. `resolve` records
+a reviewer's decision in the contributor's status file.
+"""
+import argparse
+import difflib
+import glob
+import hashlib
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verify_record as vr  # noqa: E402
+
+CATALOG_FIELDS = ("name", "roaster", "origin", "region", "producer", "varietal", "process",
+                  "roast_level", "altitude_m", "notes")
+NOTE_LIMIT = 47     # what the controller keeps of a reviewer's note
+MAX_RECORD_BYTES = 8192
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+
+
+def catalog_id(coffee):
+    return f"{slug(coffee.get('roaster')) or 'unknown'}/{slug(coffee['name']) or 'unnamed'}"
+
+
+def month_folder(body):
+    at = body.get("at", "")
+    return f"{at[0:4]}/{at[5:7]}" if re.match(r"^\d{4}-\d{2}-\d{2}T", at) else "undated"
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def set_status(library, kid, local_id, record, state, library_id="", note=""):
+    """One line per coffee in status/<kid>.json; a newer record replaces an older one's line."""
+    path = os.path.join(library, "status", kid + ".json")
+    status = read_json(path, {}) or {}
+    entries = [e for e in status.get("coffees", []) if isinstance(e, dict)]
+    current = next((e for e in entries if e.get("local_id") == local_id), None)
+    if current and current.get("record", -1) > record:
+        return False    # the contributor has sent a newer version since
+    entry = {"local_id": local_id, "record": record, "state": state}
+    if library_id:
+        entry["library_id"] = library_id
+    note = "".join(c for c in (note or "") if 0x20 <= ord(c) <= 0x7E)[:NOTE_LIMIT].strip()
+    if note:
+        entry["note"] = note
+    entries = [e for e in entries if e.get("local_id") != local_id] + [entry]
+    entries.sort(key=lambda e: e.get("local_id", 0))
+    write_text(path, json.dumps({"v": 1, "coffees": entries}, separators=(",", ":")) + "\n")
+    return True
+
+
+def similar_coffees(library, coffee):
+    """Catalog entries a reviewer should look at before adding this one."""
+    wanted = f"{coffee.get('roaster', '')} {coffee['name']}".lower().strip()
+    existing = {}
+    for path in glob.glob(os.path.join(library, "catalog", "**", "*.json"), recursive=True):
+        entry = read_json(path)
+        if isinstance(entry, dict) and entry.get("id") and entry.get("name"):
+            existing[f"{entry.get('roaster', '')} {entry['name']}".lower().strip()] = entry["id"]
+    close = difflib.get_close_matches(wanted, list(existing), n=5, cutoff=0.6)
+    name = coffee["name"].lower()
+    close += [k for k in existing if name in k and k not in close][:5]
+    return [existing[k] for k in close]
+
+
+def contributor_history(library, kid):
+    count = 0
+    for folder in ("dialins", "shots"):
+        count += len(glob.glob(os.path.join(library, folder, "**", kid + "-*.json"), recursive=True))
+    return count
+
+
+def pull_request_text(library, kid, body, proposed_id, exists):
+    rows = "\n".join(f"| {field.replace('_', ' ')} | {body[field]} |" for field in CATALOG_FIELDS if field in body)
+    similar = [s for s in similar_coffees(library, body) if s != proposed_id]
+    history = contributor_history(library, kid)
+    meta = json.dumps({"kid": kid, "local_id": body["local_id"], "record": body["record"],
+                       "library_id": proposed_id}, separators=(",", ":"))
+    lines = [
+        f"A controller has sent this coffee{' again, changed' if exists else ''}. Its record passed the "
+        "signature and value checks; whether it belongs in the library is for a person to decide.",
+        "",
+        "| | |", "| --- | --- |", rows,
+        "",
+        f"**Would be published as** `{proposed_id}`" + (" (this entry exists: merging replaces it)" if exists else ""),
+        "",
+        f"**From** key `{kid}`: " + (f"{history} measurements on file from this controller."
+                                     if history else "nothing else on file from this controller yet."),
+        "",
+        "**Similar entries already in the library:** " + (", ".join(f"`{s}`" for s in similar) if similar else "none found."),
+        "",
+        "- **Merge** to publish. Edit the file in this pull request first if a name or detail needs tidying.",
+        "- **Close** to decline. A last comment starting `Declined:` is shown to the contributor "
+        f"(first {NOTE_LIMIT} characters).",
+        "",
+        f"<!-- intake {meta} -->",
+    ]
+    return "\n".join(lines)
+
+
+def take(inbox, library, log=print):
+    """Returns (plan, report). plan: pull requests to open. report: what happened to each file."""
+    keys = vr.load_keys(os.path.join(library, "keys"))
+    files = sorted(glob.glob(os.path.join(inbox, "**", "*.json"), recursive=True))
+    loaded = []
+    for path in files:
+        try:
+            if os.path.getsize(path) > MAX_RECORD_BYTES:
+                raise ValueError("too large to be a record")
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            is_key = '\\"t\\":\\"key\\"' in text
+        except (OSError, ValueError) as error:
+            loaded.append((path, None, str(error), False))
+            continue
+        loaded.append((path, text, None, is_key))
+    loaded.sort(key=lambda item: not item[3])    # keys first: the rest of a batch needs them
+
+    plan, report = [], []
+    for path, text, problem, _ in loaded:
+        shown = os.path.relpath(path, inbox).replace("\\", "/")
+        if problem:
+            report.append((shown, "refused", problem))
+            continue
+        try:
+            kind, kid, body = vr.verify(text, keys)
+        except vr.Refused as error:
+            report.append((shown, "refused", str(error)))
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+        if kind == "key":
+            target = os.path.join(library, "keys", kid + ".json")
+            if not os.path.exists(target):
+                write_text(target, text)
+            keys[kid] = vr.parse_public(body["key"])[1]
+            report.append((shown, "filed", f"keys/{kid}.json"))
+        elif kind == "dialin":
+            target = f"dialins/{month_folder(body)}/{kid}-{digest}.json"
+            write_text(os.path.join(library, target), text)
+            report.append((shown, "filed", target))
+        elif kind == "shot":
+            target = f"shots/{month_folder(body)}/{kid}-{int(body['id'])}.json"
+            write_text(os.path.join(library, target), text)
+            report.append((shown, "filed", target))
+        else:   # a coffee: never published from here
+            local_id, record = body["local_id"], body["record"]
+            pending = f"pending/coffees/{kid}/c{local_id}-{record}.json"
+            if not set_status(library, kid, local_id, record, "review"):
+                report.append((shown, "refused", "an earlier version of a coffee that has been sent again since"))
+                continue
+            write_text(os.path.join(library, pending), text)
+            proposed = catalog_id(body)
+            catalog_path = f"catalog/{proposed}.json"
+            exists = os.path.exists(os.path.join(library, catalog_path))
+            entry = {"id": proposed}
+            entry.update({field: body[field] for field in CATALOG_FIELDS if field in body})
+            plan.append({
+                "branch": f"review/{kid}-c{local_id}-{record}",
+                "title": f"{'Change' if exists else 'Add'} {body.get('roaster', 'unknown roaster')} / {body['name']}",
+                "body": pull_request_text(library, kid, body, proposed, exists),
+                "catalog_path": catalog_path,
+                "catalog_text": json.dumps(entry, indent=1) + "\n",
+                "pending_path": pending,
+            })
+            report.append((shown, "for review", catalog_path))
+    for shown, outcome, detail in report:
+        log(f"{outcome:<10} {shown}  {detail}")
+    return plan, report
+
+
+def summary_markdown(report):
+    counts = {}
+    for _, outcome, _ in report:
+        counts[outcome] = counts.get(outcome, 0) + 1
+    lines = ["## Intake", "",
+             ", ".join(f"{n} {outcome}" for outcome, n in sorted(counts.items())) or "Nothing in the inbox.", ""]
+    if report:
+        lines += ["| File | Outcome | Detail |", "| --- | --- | --- |"]
+        lines += [f"| `{shown}` | {outcome} | {detail.replace('|', '/')} |" for shown, outcome, detail in report]
+    return "\n".join(lines) + "\n"
+
+
+# ---- self-test ------------------------------------------------------------------
+def self_test():
+    import base64
+    import tempfile
+    import build_index as bi
+
+    def person(private):
+        point = vr._mul(private, vr.G)
+        raw = b"\x04" + point[0].to_bytes(32, "big") + point[1].to_bytes(32, "big")
+        return private, vr.key_id(raw), base64.b64encode(raw).decode()
+
+    anna, ben = person(0x1111), person(0x2222)
+    coffee = {"t": "coffee", "v": 1, "at": "2026-10-10T22:51:50Z", "local_id": 4, "record": 7,
+              "name": "Idjwi Island", "roaster": "Portrait Coffee", "origin": "DR Congo", "process": "washed",
+              "roast_level": "medium-light", "altitude_m": 1900}
+    dialin = {"t": "dialin", "v": 1, "at": "2026-10-10T23:00:00Z",
+              "coffee": {"local_id": 4, "name": "Idjwi Island"},
+              "recipe": {"dose_g": 18, "yield_g": 36, "target_time_s": 26},
+              "grinder": {"model_id": 1, "unit": "um", "um_per_unit": 1, "calibration": 0},
+              "grind": 246, "result": {"time_s": 25.6, "basis": "total", "shots": 3}}
+    shot = {"t": "shot", "v": 1, "id": 60, "at": "2026-10-10T22:51:50Z",
+            "recipe": {"dose_g": 18, "yield_g": 36}, "grinder": {"unit": "um", "calibration": 0},
+            "grind": 246, "result": {"yield_g": 35.8, "time_s": 25.4, "end": "weight"}}
+
+    with tempfile.TemporaryDirectory() as root:
+        inbox, library = os.path.join(root, "inbox"), os.path.join(root, "library")
+        os.makedirs(library)
+
+        def drop(name, text):
+            write_text(os.path.join(inbox, name), text)
+
+        def env(who, body):
+            return bi._envelope(who[0], who[1], body)
+
+        # A good batch from Anna, in an order and under names that mean nothing.
+        drop("zzz/1.json", env(anna, {"t": "key", "v": 1, "alg": "ES256", "key": anna[2]}))
+        drop("a/whatever.json", env(anna, coffee))
+        drop("a/../a/d.json", env(anna, dialin))
+        drop("keys/pretend.json", env(anna, shot))
+        # And things that must not get in.
+        drop("bad/tampered.json", env(anna, dialin).replace("246", "146"))
+        drop("bad/wrong-type.json", env(anna, dict(dialin, grind="fine")))
+        drop("bad/out-of-range.json", env(anna, dict(dialin, recipe={"dose_g": 180, "yield_g": 36})))
+        drop("bad/no-key.json", env(ben, dialin))                       # Ben's key was never sent
+        drop("bad/emulator.json", env(anna, dialin).replace('"alg":"ES256"', '"alg":"EMULATOR-UNSIGNED"'))
+        drop("bad/not-json.json", "hello")
+        drop("bad/huge.json", "x" * (MAX_RECORD_BYTES + 1))
+        drop("bad/script.json", env(anna, dict(coffee, record=8, name="<script>alert(1)</script>" + "x" * 30)))
+
+        plan, report = take(inbox, library, log=lambda *_: None)
+        outcome = {shown: (what, detail) for shown, what, detail in report}
+        assert outcome["zzz/1.json"] == ("filed", f"keys/{anna[1]}.json")
+        assert outcome["a/d.json"][0] == "filed" and outcome["a/d.json"][1].startswith(f"dialins/2026/10/{anna[1]}-")
+        assert outcome["keys/pretend.json"] == ("filed", f"shots/2026/10/{anna[1]}-60.json")
+        assert outcome["a/whatever.json"] == ("for review", "catalog/portrait-coffee/idjwi-island.json")
+        for name, reason in (("tampered", "signature does not match"), ("wrong-type", "outside"),
+                             ("out-of-range", "outside"), ("no-key", "not on file"), ("emulator", "not ES256"),
+                             ("not-json", "not JSON"), ("huge", "too large"), ("script", "text of 1 to 23")):
+            what, detail = outcome[f"bad/{name}.json"]
+            assert what == "refused" and reason in detail, (name, detail)
+        # Nothing was published: the catalog is untouched, the coffee is parked.
+        assert not os.path.exists(os.path.join(library, "catalog"))
+        assert os.path.exists(os.path.join(library, "pending", "coffees", anna[1], "c4-7.json"))
+        assert not os.path.exists(os.path.join(library, "keys", ben[1] + ".json"))
+        status = read_json(os.path.join(library, "status", anna[1] + ".json"))
+        assert status == {"v": 1, "coffees": [{"local_id": 4, "record": 7, "state": "review"}]}
+        assert len(plan) == 1 and plan[0]["branch"] == f"review/{anna[1]}-c4-7"
+        assert plan[0]["title"] == "Add Portrait Coffee / Idjwi Island"
+        entry = json.loads(plan[0]["catalog_text"])
+        assert entry["id"] == "portrait-coffee/idjwi-island" and entry["altitude_m"] == 1900 and "local_id" not in entry
+        assert f'"kid":"{anna[1]}"' in plan[0]["body"] and "measurements on file" in plan[0]["body"]
+        assert "| name | Idjwi Island |" in plan[0]["body"]
+
+        # The same batch again changes nothing and files nothing twice.
+        before = sorted(glob.glob(os.path.join(library, "**", "*.json"), recursive=True))
+        take(inbox, library, log=lambda *_: None)
+        assert before == sorted(glob.glob(os.path.join(library, "**", "*.json"), recursive=True))
+
+        # The reviewer merges: published under the catalog's id.
+        assert set_status(library, anna[1], 4, 7, "published", "portrait-coffee/idjwi-island")
+        write_text(os.path.join(library, plan[0]["catalog_path"]), plan[0]["catalog_text"])
+        # A changed version arrives; a verdict on the old one comes too late to matter.
+        write_text(os.path.join(root, "inbox2", "c.json"),
+                   env(anna, dict(coffee, record=9, notes="plum")))
+        plan2, _ = take(os.path.join(root, "inbox2"), library, log=lambda *_: None)
+        assert plan2[0]["title"].startswith("Change ") and "this entry exists" in plan2[0]["body"]
+        assert not set_status(library, anna[1], 4, 7, "declined", note="late")
+        status = read_json(os.path.join(library, "status", anna[1] + ".json"))
+        assert status["coffees"] == [{"local_id": 4, "record": 9, "state": "review"}]
+        assert set_status(library, anna[1], 4, 9, "declined",
+                          note="Declined: already listed\tas Portrait / Idjwi Island, see the catalog entry")
+        note = read_json(os.path.join(library, "status", anna[1] + ".json"))["coffees"][0]["note"]
+        assert len(note) <= NOTE_LIMIT and "\t" not in note
+        # With the status saying published, the index builder files her dial-in under the entry.
+        set_status(library, anna[1], 4, 9, "published", "portrait-coffee/idjwi-island")
+        bi.build(library, min_contributors=1, log=lambda *_: None)
+        built = read_json(os.path.join(library, "index", "dialin", "portrait-coffee__idjwi-island.json"))
+        assert built["recipes"][0]["fineness_um"] == 246.0
+        assert read_json(os.path.join(library, "index", "coffees.json"))["coffees"][0]["id"] == "portrait-coffee/idjwi-island"
+    assert slug("Café  Olé!") == "caf-ol" and catalog_id({"name": "X"}) == "unknown/x"
+    print("self-test passed")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--self-test", action="store_true")
+    commands = parser.add_subparsers(dest="command")
+    t = commands.add_parser("take")
+    t.add_argument("--inbox", required=True)
+    t.add_argument("--library", required=True)
+    t.add_argument("--plan", help="where to write the pull requests to open, as JSON")
+    t.add_argument("--summary", help="a Markdown file to append the report to")
+    r = commands.add_parser("resolve")
+    r.add_argument("--library", required=True)
+    r.add_argument("--kid", required=True)
+    r.add_argument("--local-id", type=int, required=True)
+    r.add_argument("--record", type=int, required=True)
+    r.add_argument("--state", choices=("published", "declined"), required=True)
+    r.add_argument("--library-id", default="")
+    r.add_argument("--note", default="")
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+    elif args.command == "take":
+        plan, report = take(args.inbox, args.library)
+        if args.plan:
+            write_text(args.plan, json.dumps(plan, indent=1))
+        if args.summary:
+            with open(args.summary, "a", encoding="utf-8") as f:
+                f.write(summary_markdown(report))
+    elif args.command == "resolve":
+        if not re.fullmatch(r"[0-9a-f]{20}", args.kid):
+            parser.error("not a key id")
+        note = re.sub(r"^\s*declined:\s*", "", args.note, flags=re.IGNORECASE)
+        changed = set_status(args.library, args.kid, args.local_id, args.record, args.state,
+                             args.library_id if args.state == "published" else "", note)
+        print("status updated" if changed else "left alone: the contributor has sent a newer version")
+    else:
+        parser.error("give a command, or --self-test")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

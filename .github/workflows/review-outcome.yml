@@ -1,0 +1,56 @@
+# When a coffee's review pull request is merged or closed, tell its
+# contributor: the status file their controller reads says "published"
+# (with the id it was published under) or "declined" (with the reviewer's
+# note), and the index is rebuilt.
+name: Review outcome
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency:
+  group: library-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  record:
+    # Only the branches the intake makes. The pull request's text is passed as
+    # data, never put into a command.
+    if: startsWith(github.event.pull_request.head.ref, 'review/') && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Record the decision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python tools/reviews.py close
+      - name: Rebuild the index
+        run: python tools/build_index.py --root .
+      - name: Commit to main
+        run: |
+          git config user.name "library intake"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for part in status pending index; do
+            if [ -e "$part" ] || git ls-files --error-unmatch "$part" > /dev/null 2>&1; then git add -A -- "$part"; fi
+          done
+          if ! git diff --cached --quiet; then
+            git commit --quiet -m "Review outcome recorded"
+            git push --quiet origin HEAD:main
+          fi
+      - name: Remove the review branch
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: git push --quiet origin --delete "$HEAD_REF" || true
