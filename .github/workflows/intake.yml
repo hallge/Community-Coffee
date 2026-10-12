@@ -1,0 +1,103 @@
+# Takes in what controllers have pushed to the `inbox` branch: every record
+# is checked (signature, types, ranges), the good ones are filed on main,
+# and each coffee gets a pull request for a person to review. Nothing a
+# controller sends reaches the catalog without that review.
+#
+# Runs when asked (the inbox branch's own small workflow asks after every
+# push there) and once a day in case that was missed. It always runs from
+# main, so what it does cannot be changed by anything in the inbox.
+name: Intake
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+
+# One run at a time may write to main; a second waits.
+concurrency:
+  group: library-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  intake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main (the tools and the library)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: library
+          fetch-depth: 0
+      - name: Is there an inbox?
+        id: inbox
+        working-directory: library
+        run: |
+          if git ls-remote --exit-code --heads origin inbox > /dev/null; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No inbox branch yet: nothing to take in." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Check out the inbox (data only)
+        if: steps.inbox.outputs.found == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: inbox
+          path: inbox
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The tools check themselves
+        working-directory: library
+        run: |
+          python tools/verify_record.py --self-test
+          python tools/build_index.py --self-test
+          python tools/intake.py --self-test
+          python tools/reviews.py --self-test
+      - name: Check every record and file the good ones
+        if: steps.inbox.outputs.found == 'true'
+        run: |
+          mkdir -p inbox/inbox
+          python library/tools/intake.py take --inbox inbox/inbox --library library \
+            --plan "$RUNNER_TEMP/plan.json" --summary "$GITHUB_STEP_SUMMARY"
+      - name: Rebuild the index
+        working-directory: library
+        run: python tools/build_index.py --root .
+      - name: Commit to main
+        working-directory: library
+        run: |
+          git config user.name "library intake"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for part in keys dialins shots status pending index; do
+            if [ -e "$part" ] || git ls-files --error-unmatch "$part" > /dev/null 2>&1; then git add -A -- "$part"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "Nothing new for main."
+          else
+            git commit --quiet -m "Intake: records checked and filed"
+            git push --quiet origin HEAD:main
+          fi
+          git fetch --quiet origin main
+      - name: Open a pull request for each coffee
+        if: steps.inbox.outputs.found == 'true'
+        working-directory: library
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tools/reviews.py open "$RUNNER_TEMP/plan.json"
+      - name: Empty the inbox
+        if: steps.inbox.outputs.found == 'true'
+        working-directory: inbox
+        run: |
+          git config user.name "library intake"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Only what was looked at: anything pushed since stays for the next run.
+          git rm -r --quiet --ignore-unmatch -- inbox
+          mkdir -p inbox && touch inbox/.keep && git add -- inbox/.keep
+          if ! git diff --cached --quiet; then
+            git commit --quiet -m "Inbox taken in"
+            git pull --quiet --rebase origin inbox
+            git push --quiet origin HEAD:inbox
+          fi
