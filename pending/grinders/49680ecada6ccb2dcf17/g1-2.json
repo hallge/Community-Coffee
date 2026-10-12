@@ -1,1 +1,0 @@
-{"v":1,"kid":"49680ecada6ccb2dcf17","alg":"ES256","sig":"3+RhBfmSb48eBkxpq3O/zpaB5cypptoN+Q+7OlWI+bqVoAVbRhNX8zl7kkn2O/KUDDYEnF2aCmktN7DlgTwFrg==","body":"{\"t\":\"grinder\",\"v\":1,\"at\":\"2026-10-12T06:00:00Z\",\"record\":2,\"local_id\":1,\"model\":\"Setup Check Grinder\",\"burrs\":\"64 mm flat\",\"unit\":\"dial\"}"}
