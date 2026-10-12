@@ -1,1 +1,1 @@
-{"coffees":[{"library_id":"setup-check/intake-check-coffee","local_id":1,"record":1,"state":"published"}],"grinders":[{"local_id":1,"record":2,"state":"review"}],"v":1}
+{"coffees":[{"library_id":"setup-check/intake-check-coffee","local_id":1,"record":1,"state":"published"}],"grinders":[{"local_id":1,"note":"setup check, not a real grinder","record":2,"state":"declined"}],"v":1}
