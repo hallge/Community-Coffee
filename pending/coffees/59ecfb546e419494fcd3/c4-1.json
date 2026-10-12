@@ -1,1 +1,0 @@
-{"v":1,"kid":"59ecfb546e419494fcd3","alg":"ES256","sig":"UFwUBcjvK6KygzaUmLG+4r52BbRw47f88opcx7J2QZsF10GYB9pvXFg7uaQ0Rp72FGGXbCZQlAwqhVcbU4qk+A==","body":"{\"t\":\"coffee\",\"v\":1,\"at\":\"2026-10-12T06:23:54Z\",\"record\":1,\"local_id\":4,\"name\":\"Emulator Link Check\",\"roaster\":\"Setup Check\",\"origin\":\"Nowhere\",\"process\":\"washed\",\"roast_level\":\"medium\"}"}
