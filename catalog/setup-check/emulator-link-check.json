@@ -1,0 +1,8 @@
+{
+ "id": "setup-check/emulator-link-check",
+ "name": "Emulator Link Check",
+ "roaster": "Setup Check",
+ "origin": "Nowhere",
+ "process": "washed",
+ "roast_level": "medium"
+}
