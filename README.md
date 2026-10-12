@@ -69,7 +69,7 @@ coffee.
 | `shots/<yyyy>/<mm>/` | Shots, where an owner shares them | Intake |
 | `pending/coffees/<key id>/`, `pending/grinders/<key id>/` | Coffees and grinders waiting for review | Intake |
 | `status/<key id>.json` | Where each contributor's coffees and grinders stand | Intake, Review outcome |
-| `index/` | What controllers read: coffee list, grinder list, community figures, grinder fits | Built, never edited |
+| `index/` | What controllers read: coffee list, grinder list, community figures, grinder fits, and how fast the grind follows a coffee's age (`age.json`) | Built, never edited |
 | `tools/` | The checks and builders the workflows run | By hand |
 
 ## The tools

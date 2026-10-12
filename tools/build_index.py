@@ -44,6 +44,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import verify_record as vr  # noqa: E402
 
 MIN_ITEMS_FOR_SCALE = 3     # coffees in common before an unmarked dial's scale is fitted
+# Bean age. As roasted coffee ages a shot runs faster at the same grind, so its owner grinds
+# finer. The rate is measured, not assumed: from contributors who settled the same coffee on
+# the same grinder at two ages at least this many days apart.
+MIN_AGE_GAP_DAYS = 5
+MIN_AGE_PAIRS = 3           # such pairs before a rate is published at all
+MAX_AGE_DAYS = 365
 ROUNDS = 60
 
 
@@ -57,6 +63,18 @@ def library_file(library_id):
 def recipe_class(recipe):
     """Recipes close enough for one grind: dose to half a gram, yield to two grams."""
     return round(recipe["dose_g"] * 2) / 2, round(recipe["yield_g"] / 2) * 2
+
+
+def age_days(body):
+    """Days off roast when the record was made, or None."""
+    import datetime
+    try:
+        roast = datetime.date.fromisoformat(body["roast_date"])
+        made = datetime.date.fromisoformat(body["at"][:10])
+    except (KeyError, ValueError, TypeError):
+        return None
+    days = (made - roast).days
+    return days if 0 <= days <= MAX_AGE_DAYS else None
 
 
 def read_json(path):
@@ -112,6 +130,7 @@ def load_observations(root, accept_unsigned=False, log=print):
             "item": (library_id, recipe_class(body["recipe"])),
             "setting": float(body["grind"]),
             "time_s": float(body["result"]["time_s"]),
+            "age_days": age_days(body),
         })
     return observations
 
@@ -123,8 +142,10 @@ def collapse(observations):
         groups.setdefault((o["instance"], o["item"]), []).append(o)
     points = []
     for (instance, item), group in groups.items():
+        ages = [o["age_days"] for o in group if o.get("age_days") is not None]
         points.append(dict(group[0], setting=statistics.median(o["setting"] for o in group),
-                           time_s=statistics.median(o["time_s"] for o in group), count=len(group)))
+                           time_s=statistics.median(o["time_s"] for o in group), count=len(group),
+                           age_days=statistics.median(ages) if ages else None))
     return points
 
 
@@ -185,10 +206,66 @@ def fit(points):
     return fineness, scale, offset
 
 
-def build(root, accept_unsigned=False, min_contributors=2, log=print):
-    observations = load_observations(root, accept_unsigned, log)
+def age_rate(observations, scale):
+    """Microns of burr gap per day off roast, and how many pairs it rests on.
+
+    A pair is the same grinder (same calibration) settling the same coffee and recipe
+    at two ages. Whatever the grinder's offset and the coffee's fineness are, they are
+    the same in both, so the difference is the ageing alone. The median over all
+    pairs is the rate; None until there are enough.
+    """
+    groups = {}
+    for o in observations:
+        if o.get("age_days") is not None and o["instance"] in scale:
+            groups.setdefault((o["instance"], o["item"]), []).append(o)
+    rates = []
+    for (instance, _), group in groups.items():
+        group.sort(key=lambda o: o["age_days"])
+        for i, young in enumerate(group):
+            for old in group[i + 1:]:
+                gap = old["age_days"] - young["age_days"]
+                if gap >= MIN_AGE_GAP_DAYS:
+                    rates.append((old["setting"] - young["setting"]) / scale[instance] / gap)
+    if len(rates) < MIN_AGE_PAIRS:
+        return None, len(rates)
+    rate = statistics.median(rates)
+    return (rate if -5.0 <= rate <= 5.0 else None), len(rates)
+
+
+def fit_with_age(observations):
+    """The fit, allowing for age. Returns (points, fineness, scale, offset, rate, pairs).
+
+    A first fit gives every grinder's scale, which is what turns its settings into
+    microns; with those the ageing rate is measured. If there is one, each dial-in
+    is moved to the age its coffee was typically settled at, so that one made on an
+    old bag neither widens the spread nor drags the coffee's figure, and the fit is
+    done again. Each point's age_days is then the age its coffee's figure is for.
+    """
     points = collapse(observations)
     fineness, scale, offset = fit(points)
+    rate, pairs = age_rate(observations, scale)
+    if rate is None:
+        return points, fineness, scale, offset, rate, pairs
+    by_item = {}
+    for o in observations:
+        if o.get("age_days") is not None:
+            by_item.setdefault(o["item"], []).append(o["age_days"])
+    usual = {item: statistics.median(ages) for item, ages in by_item.items()}
+    moved = []
+    for o in observations:
+        o = dict(o)
+        if o.get("age_days") is not None and o["instance"] in scale:
+            o["setting"] -= scale[o["instance"]] * rate * (o["age_days"] - usual[o["item"]])
+            o["age_days"] = usual[o["item"]]
+        moved.append(o)
+    points = collapse(moved)
+    fineness, scale, offset = fit(points)
+    return points, fineness, scale, offset, rate, pairs
+
+
+def build(root, accept_unsigned=False, min_contributors=2, log=print):
+    observations = load_observations(root, accept_unsigned, log)
+    points, fineness, scale, offset, rate, pairs = fit_with_age(observations)
     by_item, by_instance = {}, {}
     for p in points:
         by_item.setdefault(p["item"], []).append(p)
@@ -213,6 +290,12 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
         except (vr.Refused, ValueError, OSError) as error:
             log(f"catalog entry ignored: {path}: {error}")
     write(os.path.join(out, "coffees.json"), {"v": 1, "coffees": coffees})
+
+    # How fast the grind follows the coffee's age.
+    aging = {"v": 1, "pairs": pairs}
+    if rate is not None:
+        aging["um_per_day"] = round(rate, 3)
+    write(os.path.join(out, "age.json"), aging)
 
     # Grinder models reviewers have listed.
     listed = []
@@ -250,6 +333,8 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
             "contributors": len(contributors),
             "dialins": sum(p["count"] for p in ps),
             "time_s": round(statistics.median(p["time_s"] for p in ps), 1),
+            **({"age_days": round(statistics.median(a))} if (a := [p["age_days"] for p in ps
+                                                            if p.get("age_days") is not None]) else {}),
             "fineness_um": round(fineness[item], 1),
             "spread_um": round(1.4826 * statistics.median(residuals), 1) if len(residuals) > 1 else 0,
             "models": [dict({"library_id": m} if isinstance(m, str) else {"model_id": m}, unit=u,
@@ -306,6 +391,13 @@ EXAMPLE_PEOPLE = {
 }
 
 
+# Invented: how fast the example's contributors went finer as a bag aged, and who
+# settled which coffee a second time.
+EXAMPLE_UM_PER_DAY = -0.8
+EXAMPLE_AGED = {"anna": ["portrait/idjwi-island", "example/kenya-aa"], "ben": ["example/ethiopia-guji"],
+                "cara": ["example/colombia-decaf"]}
+
+
 def _sign(private, body_text):
     e = int.from_bytes(hashlib.sha256(body_text.encode()).digest(), "big")
     k = int.from_bytes(hashlib.sha256(private.to_bytes(32, "big") + body_text.encode()).digest(), "big") % vr.N
@@ -343,13 +435,23 @@ def make_example(root, log=print):
             truth[(kid, library_id)] = setting
             entry = next(c for c in EXAMPLE_COFFEES if c["id"] == library_id)
             put(f"dialins/2026/10/{kid}-{n}.json", _envelope(private, kid, {
-                "t": "dialin", "v": 1,
+                "t": "dialin", "v": 1, "at": "2026-10-01T08:00:00Z", "roast_date": "2026-09-21",
                 "coffee": {"local_id": n, "name": entry["name"]},
                 "recipe": {"dose_g": 18, "yield_g": 36, "target_time_s": 26},
                 "grinder": dict(grinder, calibration=0),
                 "grind": setting,
                 "result": {"time_s": 26.0 + 0.2 * n, "basis": "total", "shots": 3}}))
             status.append({"local_id": n, "record": n, "state": "published", "library_id": library_id})
+            if name in EXAMPLE_AGED and library_id in EXAMPLE_AGED[name]:
+                # The same bag three weeks on: settled again, finer.
+                later = round(a * (EXAMPLE_FINENESS[library_id] + EXAMPLE_UM_PER_DAY * 21) + b)
+                put(f"dialins/2026/10/{kid}-{n}b.json", _envelope(private, kid, {
+                    "t": "dialin", "v": 1, "at": "2026-10-22T08:00:00Z", "roast_date": "2026-09-21",
+                    "coffee": {"local_id": n, "name": entry["name"]},
+                    "recipe": {"dose_g": 18, "yield_g": 36, "target_time_s": 26},
+                    "grinder": dict(grinder, calibration=0),
+                    "grind": later,
+                    "result": {"time_s": 26.1, "basis": "total", "shots": 3}}))
         put(f"status/{kid}.json", json.dumps({"v": 1, "coffees": status}))
     log(f"example library written to {root}")
     return truth
@@ -388,6 +490,21 @@ def self_test():
     _, s3, _ = fit(few)
     assert ("d", 0) not in s3
 
+    # 1b. The ageing rate: exact from invented pairs, withheld when there are too few,
+    #     and unmoved by one contributor who went the other way.
+    def aged(who, coffee, age, setting):
+        return {"instance": (who, 0), "item": (coffee, (18.0, 36)), "age_days": age, "setting": setting}
+    marks = {("a", 0): 1.0, ("c", 0): 0.2}
+    obs = [aged("a", "k1", 8, 250), aged("a", "k1", 28, 234), aged("a", "k2", 10, 240), aged("a", "k2", 20, 232),
+           aged("c", "k1", 5, 52), aged("c", "k1", 30, 48)]
+    rate, pairs = age_rate(obs, marks)
+    assert pairs == 3 and abs(rate - (-0.8)) < 1e-9, (rate, pairs)
+    assert age_rate(obs[:4], marks) == (None, 2)                       # too few to say
+    assert age_rate(obs + [aged("a", "k1", 9, 250)], marks)[1] == 4   # 8 and 9 days: too close to count
+    odd = obs + [aged("c", "k2", 5, 40), aged("c", "k2", 25, 60)]    # one bag that went coarser
+    assert abs(age_rate(odd, marks)[0] - (-0.8)) < 1e-9
+    assert age_rate([dict(o, age_days=None) for o in obs], marks) == (None, 0)
+
     # 2. End to end: signed example records in, index files out.
     with tempfile.TemporaryDirectory() as root:
         true_settings = make_example(root, log=lambda *_: None)
@@ -397,6 +514,9 @@ def self_test():
         guji = read_json(os.path.join(root, "index", "dialin", "example__ethiopia-guji.json"))
         entry = guji["recipes"][0]
         assert entry["contributors"] == 4 and entry["dose_g"] == 18 and entry["yield_g"] == 36
+        assert 10 <= entry["age_days"] <= 31, entry
+        aging = read_json(os.path.join(root, "index", "age.json"))
+        assert aging["pairs"] == 4 and abs(aging["um_per_day"] - EXAMPLE_UM_PER_DAY) < 0.15, aging
         assert entry["spread_um"] < 4, entry       # settings are whole numbers: a little rounding
         e64 = [m for m in entry["models"] if m["model_id"] == 1][0]
         assert e64["n"] == 2 and e64["unit"] == "um"
