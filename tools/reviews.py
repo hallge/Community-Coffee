@@ -74,8 +74,8 @@ def decision(body, merged, comments, files, read_catalog):
         return None
     if not re.fullmatch(r"[0-9a-f]{20}", str(kid)):
         return None
-    kind = "grinder" if meta.get("kind") == "grinder" else "coffee"
-    folder = "grinders/" if kind == "grinder" else "catalog/"
+    kind = meta.get("kind") if meta.get("kind") in ("grinder", "machine") else "coffee"
+    folder = {"grinder": "grinders/", "machine": "machines/"}.get(kind, "catalog/")
     result = {"kind": kind, "kid": kid, "local_id": local_id, "record": record}
     if merged:
         # The reviewer may have renamed the entry: go by what was merged.
@@ -109,12 +109,11 @@ def close_review():
     if result is None:
         print("not a review pull request, or nothing was published: status left alone")
         return
-    grinder = result["kind"] == "grinder"
+    section, letter = {"grinder": ("grinders", "g"), "machine": ("machines", "m")}.get(result["kind"],
+                                                                                       ("coffees", "c"))
     changed = intake.set_status(".", result["kid"], result["local_id"], result["record"],
-                                result["state"], result["library_id"], result["note"],
-                                "grinders" if grinder else "coffees")
-    pending = (f"pending/grinders/{result['kid']}/g{result['local_id']}-{result['record']}.json" if grinder
-               else f"pending/coffees/{result['kid']}/c{result['local_id']}-{result['record']}.json")
+                                result["state"], result["library_id"], result["note"], section)
+    pending = f"pending/{section}/{result['kid']}/{letter}{result['local_id']}-{result['record']}.json"
     if os.path.exists(pending):
         os.remove(pending)   # decided either way: no longer waiting
     print(f"{result['state']}: key {result['kid']} {result['kind']} {result['local_id']} record {result['record']}"
@@ -137,6 +136,13 @@ def self_test():
     listed = {"grinders/home-built-64.json": {"id": "home-built-64", "model": "Home Built 64", "unit": "dial"}}
     g = decision(gbody, True, [], ["grinders/home-built-64.json"], listed.get)
     assert g["kind"] == "grinder" and g["library_id"] == "home-built-64" and g["state"] == "published"
+    # A machine profile is reviewed the same way.
+    mbody = '<!-- intake {"kind":"machine","kid":"0123456789abcdef0123","local_id":1,"record":12} -->'
+    mlisted = {"machines/breville-dual-boiler-2-cup-button.json": {"id": "breville-dual-boiler-2-cup-button"}}
+    m = decision(mbody, True, [], ["machines/breville-dual-boiler-2-cup-button.json"], mlisted.get)
+    assert m["kind"] == "machine" and m["library_id"] == "breville-dual-boiler-2-cup-button" and m["state"] == "published"
+    m = decision(mbody, False, ["declined: the 2 CUP button is volumetric"], [], mlisted.get)
+    assert m["kind"] == "machine" and m["state"] == "declined" and m["note"] == "the 2 CUP button is volumetric"
     assert decision(gbody, True, [], ["catalog/portrait/idjwi-island.json"], catalog.get) is None   # wrong folder
     assert decision(body.replace("0123456789abcdef0123", "../../etc"), True, [], [], catalog.get) is None
     assert decision('<!-- intake {"kid":1} -->', False, [], [], catalog.get) is None

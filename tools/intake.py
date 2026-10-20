@@ -46,7 +46,9 @@ import verify_record as vr  # noqa: E402
 
 CATALOG_FIELDS = ("name", "roaster", "origin", "region", "producer", "varietal", "process",
                   "roast_level", "altitude_m", "notes")
-GRINDER_FIELDS = ("model", "burrs", "unit", "um_per_unit")
+GRINDER_FIELDS = ("model", "burrs", "unit", "um_per_unit", "divisor", "sub_steps")
+MACHINE_FIELDS = ("maker", "model", "control", "style", "manual_start", "hold_preinfusion",
+                  "tap_preinfusion", "power_toggle", "self_stop_s")
 NOTE_LIMIT = 47     # what the controller keeps of a reviewer's note
 MAX_RECORD_BYTES = 8192
 
@@ -152,6 +154,33 @@ def pull_request_text(library, kid, body, proposed_id, exists):
     return "\n".join(lines)
 
 
+def machine_request_text(library, kid, body, proposed_id, exists):
+    rows = "\n".join(f"| {field.replace('_', ' ')} | {body[field]} |" for field in MACHINE_FIELDS if field in body)
+    existing = sorted(os.path.splitext(os.path.basename(p))[0]
+                      for p in glob.glob(os.path.join(library, "machines", "*.json")))
+    close = [e for e in difflib.get_close_matches(proposed_id, existing, n=5, cutoff=0.5) if e != proposed_id]
+    meta = json.dumps({"kind": "machine", "kid": kid, "local_id": body["local_id"], "record": body["record"],
+                       "library_id": proposed_id}, separators=(",", ":"))
+    return "\n".join([
+        f"A controller's owner has set up this espresso machine{' again, changed' if exists else ''}. Its record "
+        "passed the signature and value checks; whether the rules are right for this machine and this control "
+        "is for a person to decide. The same machine worked by another button or lever is another entry.",
+        "", "| | |", "| --- | --- |", rows, "",
+        f"**Would be listed as** `{proposed_id}`" + (" (this entry exists: merging replaces it)" if exists else ""),
+        "",
+        "Style: `toggle_button` (one press starts, one stops: the bot does both), `start_button` (the bot starts, "
+        "the machine stops itself), `start_stop_buttons` (one bot on start, another on stop), `hold_button` (the "
+        "bot holds the button for the whole shot), `manual` (lever, knob, wheel or paddle: nothing is pressed).",
+        "",
+        "To decline, close this request with a comment starting `declined:`; what follows is shown to the owner.",
+        "",
+        ("Entries with a similar name: " + ", ".join(f"`{e}`" for e in close)) if close else
+        "No entry with a similar name.",
+        "",
+        f"<!-- intake {meta} -->",
+    ])
+
+
 def grinder_request_text(library, kid, body, proposed_id, exists):
     rows = "\n".join(f"| {field.replace('_', ' ')} | {body[field]} |" for field in GRINDER_FIELDS if field in body)
     existing = sorted(os.path.splitext(os.path.basename(p))[0]
@@ -238,6 +267,27 @@ def take(inbox, library, log=print):
                 "branch": f"review/{kid}-g{local_id}-{record}",
                 "title": f"{'Change' if exists else 'Add'} grinder: {body['model']}",
                 "body": grinder_request_text(library, kid, body, proposed, exists),
+                "catalog_path": listed_path,
+                "catalog_text": json.dumps(entry, indent=1) + "\n",
+                "pending_path": pending,
+            })
+            report.append((shown, "for review", listed_path))
+        elif kind == "machine":   # a machine profile for the shared list: reviewed, like a grinder
+            local_id, record = body["local_id"], body["record"]
+            pending = f"pending/machines/{kid}/m{local_id}-{record}.json"
+            if not set_status(library, kid, local_id, record, "review", section="machines"):
+                report.append((shown, "refused", "an earlier version of a machine that has been sent again since"))
+                continue
+            write_text(os.path.join(library, pending), text)
+            proposed = (slug(f"{body['maker']} {body['model']} {body['control']}")[:39].strip("-")) or "unnamed"
+            listed_path = f"machines/{proposed}.json"
+            exists = os.path.exists(os.path.join(library, listed_path))
+            entry = {"id": proposed}
+            entry.update({field: body[field] for field in MACHINE_FIELDS if field in body})
+            plan.append({
+                "branch": f"review/{kid}-m{local_id}-{record}",
+                "title": f"{'Change' if exists else 'Add'} machine: {body['maker']} {body['model']} ({body['control']})",
+                "body": machine_request_text(library, kid, body, proposed, exists),
                 "catalog_path": listed_path,
                 "catalog_text": json.dumps(entry, indent=1) + "\n",
                 "pending_path": pending,

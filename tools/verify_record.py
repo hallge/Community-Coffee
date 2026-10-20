@@ -81,7 +81,8 @@ def ecdsa_verify(public, digest, r, s):
 
 
 # ---- records ----------------------------------------------------------------
-TYPES = ("key", "coffee", "grinder", "dialin", "shot")
+TYPES = ("key", "coffee", "grinder", "machine", "dialin", "shot")
+MACHINE_STYLES = ("toggle_button", "start_button", "manual", "start_stop_buttons", "hold_button")
 KEY_ID_HEX = 20
 
 
@@ -150,7 +151,23 @@ def check_recipe(r):
     _number(r, "bloom_pause_s", 1, 45, required=False)
 
 
+DIVISORS = (1, 2, 4, 5, 10, 20, 25, 50, 100)   # core/SettingFormat.h validDivisor
+
+
+def check_reading(g):
+    """How a stored setting is read on this grinder: whole steps, a fraction of a step, or two rings."""
+    divisor = g.get("divisor", 1)
+    sub_steps = g.get("sub_steps", 0)
+    if isinstance(divisor, bool) or divisor not in DIVISORS:
+        raise Refused("grinder.divisor is not one the controller offers")
+    if isinstance(sub_steps, bool) or not isinstance(sub_steps, int) or not (sub_steps == 0 or 2 <= sub_steps <= 99):
+        raise Refused("grinder.sub_steps is outside 2 to 99")
+    if sub_steps and divisor != 1:
+        raise Refused("a ringed dial has no divisor")
+
+
 def check_grinder(g):
+    check_reading(g)
     _text(g, "unit", 7)
     _text(g, "model", 31, required=False)
     _text(g, "burrs", 23, required=False)
@@ -158,6 +175,26 @@ def check_grinder(g):
     _text(g, "library_id", 39, required=False)
     _number(g, "um_per_unit", 0.01, 1000, required=False)
     _number(g, "calibration", 0, 65535)
+
+
+def check_machine(m, full=True):
+    """How an espresso machine is worked. full: a description for the shared list; else as a shot carries it."""
+    if m.get("style") not in MACHINE_STYLES:
+        raise Refused("machine.style is not one the controller offers")
+    _text(m, "maker", 23, required=full)
+    _text(m, "model", 31, required=full)
+    _text(m, "control", 31, required=full)
+    _text(m, "library_id", 39, required=False)
+    if "clock_from" in m and m["clock_from"] != "first_drip":
+        raise Refused("machine.clock_from is not first_drip")
+    if full:
+        if "manual_start" in m and m["manual_start"] not in ("tap", "first_drip"):
+            raise Refused("manual_start is neither tap nor first_drip")
+        for flag in ("hold_preinfusion", "tap_preinfusion", "power_toggle"):
+            _number(m, flag, 0, 1)
+        _number(m, "self_stop_s", 1, 600, required=False)
+        if m["style"] != "toggle_button" and m["hold_preinfusion"]:
+            raise Refused("only a button the bot holds can hold pre-infusion")
 
 
 def check_body(body):
@@ -174,7 +211,13 @@ def check_body(body):
         _text(body, "model", 31)
         _text(body, "burrs", 23, required=False)
         _text(body, "unit", 7)
+        check_reading(body)
         _number(body, "um_per_unit", 0.01, 1000, required=False)
+        _number(body, "local_id", 1, 65535)
+        _number(body, "record", 0, 4294967295)
+    elif kind == "machine":
+        # A machine and the rules for working it, set up by its owner, for a reviewer.
+        check_machine(body)
         _number(body, "local_id", 1, 65535)
         _number(body, "record", 0, 4294967295)
     elif kind == "dialin":
@@ -182,6 +225,7 @@ def check_body(body):
         check_recipe(body.get("recipe") or {})
         check_grinder(body.get("grinder") or {})
         _number(body, "grind", 1, 2000)
+        _number(body, "frozen_days", 0, 3650, required=False)   # days of the bag's age spent frozen
         result = body.get("result") or {}
         _number(result, "time_s", 5, 90)
         _number(result, "shots", 1, 10)
@@ -193,10 +237,14 @@ def check_body(body):
         check_recipe(body.get("recipe") or {})
         check_grinder(body.get("grinder") or {})
         _number(body, "grind", 1, 2000, required=False)
+        _number(body, "frozen_days", 0, 3650, required=False)
         result = body.get("result") or {}
         _number(result, "yield_g", 0, 1000)
         _number(result, "time_s", 0, 90)
         _number(result, "pour_flow_gs", 0, 100, required=False)
+        _number(result, "ratio", 0, 40, required=False)      # yield over dose, as brewed
+        if "machine" in body:
+            check_machine(body["machine"], full=False)
     return kind
 
 
@@ -313,6 +361,15 @@ def self_test():
     assert "not ES256" in refused(envelope(coffee, alg="EMULATOR-UNSIGNED"))
     assert "fingerprint" in refused(envelope(key_body, who="0" * 20), {})
     assert "outside" in refused(envelope(dialin.replace('"dose_g":18', '"dose_g":180')))
+    # How the setting is read: whole steps unless the grinder says otherwise.
+    assert verify(envelope(dialin.replace('"unit":"um"', '"unit":"dial","divisor":10')), keys)[0] == "dialin"
+    assert verify(envelope(dialin.replace('"unit":"um"', '"unit":"sette","sub_steps":9')), keys)[0] == "dialin"
+    assert "divisor" in refused(envelope(dialin.replace('"unit":"um"', '"unit":"dial","divisor":3')))
+    assert "sub_steps" in refused(envelope(dialin.replace('"unit":"um"', '"unit":"dial","sub_steps":1')))
+    assert "no divisor" in refused(envelope(dialin.replace('"unit":"um"', '"unit":"dial","sub_steps":9,"divisor":10')))
+    # Days in the freezer: optional, a count of days.
+    assert verify(envelope(dialin.replace('"grind":246', '"frozen_days":30,"grind":246')), keys)[0] == "dialin"
+    assert "outside" in refused(envelope(dialin.replace('"grind":246', '"frozen_days":-1,"grind":246')))
     grinder = '{"t":"grinder","v":1,"record":3,"local_id":2,"model":"Home Built 64","unit":"dial"}'
     assert verify(envelope(grinder), keys)[0] == "grinder"
     assert "unit is missing" in refused(envelope(grinder.replace(',"unit":"dial"', "")))
