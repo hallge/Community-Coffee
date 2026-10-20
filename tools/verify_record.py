@@ -288,7 +288,14 @@ def verify(envelope_text, keys):
     if not ecdsa_verify(public, digest, int.from_bytes(raw_sig[:32], "big"),
                         int.from_bytes(raw_sig[32:], "big")):
         raise Refused("signature does not match")
-    return check_body(body), kid, body
+    try:
+        kind = check_body(body)
+    except Refused as error:
+        # Signed by a key on file, refused for what it says: who sent it is known, so the refusal can
+        # be reported back to that controller (intake.py tell_refused).
+        error.kid, error.body = kid, body
+        raise
+    return kind, kid, body
 
 
 def load_keys(folder):

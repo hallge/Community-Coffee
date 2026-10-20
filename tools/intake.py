@@ -105,6 +105,24 @@ def set_status(library, kid, local_id, record, state, library_id="", note="", se
     return True
 
 
+STATUS_SECTIONS = {"coffee": "coffees", "grinder": "grinders", "machine": "machines"}
+
+
+def tell_refused(library, error):
+    """A coffee, grinder or machine record signed by a key on file but refused for what it says: its
+    line in the contributor's status file says so, with the reason, so that the controller can show it
+    and offer to send the item again. Anything not signed by a key on file tells no one anything."""
+    kid, body = getattr(error, "kid", None), getattr(error, "body", None)
+    if not kid or not isinstance(body, dict):
+        return False
+    section = STATUS_SECTIONS.get(body.get("t"))
+    local_id, record = body.get("local_id"), body.get("record")
+    if not section or not all(isinstance(v, int) and not isinstance(v, bool) and 0 < v < 2 ** 32
+                              for v in (local_id, record)):
+        return False
+    return set_status(library, kid, local_id, record, "refused", note=str(error), section=section)
+
+
 def similar_coffees(library, coffee):
     """Catalog entries a reviewer should look at before adding this one."""
     wanted = f"{coffee.get('roaster', '')} {coffee['name']}".lower().strip()
@@ -235,6 +253,7 @@ def take(inbox, library, log=print):
             kind, kid, body = vr.verify(text, keys)
         except vr.Refused as error:
             report.append((shown, "refused", str(error)))
+            tell_refused(library, error)
             continue
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
         if kind == "key":
@@ -380,7 +399,10 @@ def self_test():
         drop("bad/emulator.json", env(anna, dialin).replace('"alg":"ES256"', '"alg":"EMULATOR-UNSIGNED"'))
         drop("bad/not-json.json", "hello")
         drop("bad/huge.json", "x" * (MAX_RECORD_BYTES + 1))
-        drop("bad/script.json", env(anna, dict(coffee, record=8, name="<script>alert(1)</script>" + "x" * 30)))
+        drop("bad/script.json", env(anna, dict(coffee, local_id=5, record=8, name="<script>alert(1)</script>" + "x" * 30)))
+        # A machine Anna signed, refused for what it says (a style the controller does not offer).
+        drop("bad/machine.json", env(anna, {"t": "machine", "v": 1, "record": 12, "local_id": 1, "maker": "Acme",
+                                             "model": "One", "control": "lever", "style": "warp_drive"}))
 
         plan, report = take(inbox, library, log=lambda *_: None)
         outcome = {shown: (what, detail) for shown, what, detail in report}
@@ -398,7 +420,16 @@ def self_test():
         assert os.path.exists(os.path.join(library, "pending", "coffees", anna[1], "c4-7.json"))
         assert not os.path.exists(os.path.join(library, "keys", ben[1] + ".json"))
         status = read_json(os.path.join(library, "status", anna[1] + ".json"))
-        assert status["coffees"] == [{"local_id": 4, "record": 7, "state": "review"}]
+        # Signed by her but refused for what they say: her controller is told why, line by line.
+        refused_coffee = status["coffees"][1]
+        assert status["coffees"][0] == {"local_id": 4, "record": 7, "state": "review"}
+        assert refused_coffee["local_id"] == 5 and refused_coffee["record"] == 8 and refused_coffee["state"] == "refused"
+        assert "text of 1 to 23" in refused_coffee["note"]
+        assert status["machines"] == [{"local_id": 1, "record": 12, "state": "refused",
+                                       "note": status["machines"][0]["note"]}] and status["machines"][0]["note"]
+        assert outcome["bad/machine.json"][0] == "refused"
+        # Records not signed by a key on file tell no one anything (tampered, unknown key, emulator...).
+        assert ben[1] + ".json" not in os.listdir(os.path.join(library, "status"))
         assert status["grinders"] == [{"local_id": 2, "record": 11, "state": "review"}]
         assert outcome["a/g.json"] == ("for review", "grinders/home-built-64.json")
         gplan = [p for p in plan if p["branch"].endswith("-g2-11")][0]
@@ -432,7 +463,7 @@ def self_test():
         assert plan2[0]["title"].startswith("Change ") and "this entry exists" in plan2[0]["body"]
         assert not set_status(library, anna[1], 4, 7, "declined", note="late")
         status = read_json(os.path.join(library, "status", anna[1] + ".json"))
-        assert status["coffees"] == [{"local_id": 4, "record": 9, "state": "review"}]
+        assert [e for e in status["coffees"] if e["local_id"] == 4] == [{"local_id": 4, "record": 9, "state": "review"}]
         assert set_status(library, anna[1], 4, 9, "declined",
                           note="Declined: already listed\tas Portrait / Idjwi Island, see the catalog entry")
         note = read_json(os.path.join(library, "status", anna[1] + ".json"))["coffees"][0]["note"]
