@@ -13,6 +13,8 @@ Reads, under the root:
 
 Writes, under root/index:
     coffees.json                        every published coffee, for searching
+    taste.json                          coffee ratings: each coffee's taste (from 2 contributors),
+                                        and anonymous drinkers' stars, for recommendations
     dialin/<coffee file>.json           what contributors settled on for one coffee
     fit/<key id>.json                   how each contributor's grinder sits against the common scale
 
@@ -174,6 +176,73 @@ def load_observations(root, accept_unsigned=False, log=print):
             "age_days": age_days(body),
         })
     return observations
+
+
+def taste_key(coffee, kid, published):
+    """The coffee a rating is about: its library entry, else its roaster and name."""
+    library_id = coffee.get("library_id") or published.get((kid, coffee.get("local_id")))
+    if library_file(library_id):
+        return library_id
+    roaster = " ".join(str(coffee.get("roaster", "")).lower().split())
+    name = " ".join(str(coffee.get("name", "")).lower().split())
+    return f"~{roaster}/{name}" if name else None
+
+
+def build_taste(root, min_contributors=2, log=print):
+    """index/taste.json: per coffee rated by enough contributors, its mean taste; and, per anonymous
+    drinker with three or more of those coffees rated, their stars (for 'people like you')."""
+    keys = vr.load_keys(os.path.join(root, "keys"))
+    published = {}
+    for path in glob.glob(os.path.join(root, "status", "*.json")):
+        kid = os.path.splitext(os.path.basename(path))[0]
+        try:
+            for entry in read_json(path).get("coffees", []):
+                if entry.get("state") == "published" and entry.get("library_id"):
+                    published[(kid, entry.get("local_id"))] = entry["library_id"]
+        except (ValueError, OSError, AttributeError):
+            pass
+    ratings = []
+    for path in sorted(glob.glob(os.path.join(root, "tastes", "*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                kind, kid, body = vr.verify(f.read(), keys)
+            if kind != "taste":
+                continue
+        except (vr.Refused, ValueError, KeyError, OSError) as error:
+            log(f"skipped {path}: {error}")
+            continue
+        key = taste_key(body["coffee"], kid, published)
+        if key:
+            ratings.append((key, kid, int(body.get("drinker", 0)), body))
+    by_coffee = {}
+    for key, kid, drinker, body in ratings:
+        by_coffee.setdefault(key, []).append((kid, drinker, body))
+    coffees = {}
+    for key, rs in sorted(by_coffee.items()):
+        if len({kid for kid, _, _ in rs}) < min_contributors:
+            continue    # too few people: nothing published about it
+        stars = [int(b["stars"]) for _, _, b in rs]
+        cup = {}
+        for name in vr.CUP:
+            values = [b["cup"][name] for _, _, b in rs if name in b.get("cup", {})]
+            if len(values) >= 2:
+                cup[name] = round(statistics.fmean(values), 2)
+        tasted = [b.get("flavours", []) for _, _, b in rs if b.get("flavours")]
+        flavours = ({name: round(sum(name in f for f in tasted) / len(tasted), 2) for name in vr.FLAVOURS}
+                    if len(tasted) >= 2 else {})
+        first = rs[0][2]["coffee"]
+        coffees[key] = {"name": first.get("name", ""), "roaster": first.get("roaster", ""),
+                        "n": len(rs), "contributors": len({kid for kid, _, _ in rs}),
+                        "stars": round(statistics.fmean(stars), 2),
+                        "stars_hist": [stars.count(n) for n in range(1, 6)],
+                        "cup": cup, "flavours": flavours}
+    people = {}
+    for key, kid, drinker, body in ratings:
+        if key in coffees:
+            person = hashlib.sha256(f"{kid}/{drinker}".encode()).hexdigest()[:12]
+            people.setdefault(person, {})[key] = int(body["stars"])
+    people = [{"id": p, "r": r} for p, r in sorted(people.items()) if len(r) >= 3]
+    return {"v": 1, "coffees": coffees, "people": people}
 
 
 def collapse(observations):
@@ -568,6 +637,9 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
             log(f"catalog entry ignored: {path}: {error}")
     write(os.path.join(out, "coffees.json"), {"v": 1, "coffees": coffees})
 
+    # Coffee ratings.
+    write(os.path.join(out, "taste.json"), build_taste(root, min_contributors, log))
+
     # How fast the grind follows the coffee's age.
     aging = {"v": 1, "pairs": pairs}
     if rate is not None:
@@ -951,6 +1023,36 @@ def self_test():
         build(root, log=lambda *_: None)
         index = read_json(os.path.join(root, "index", "coffees.json"))
         assert len(index["coffees"]) == 4
+        # Coffee ratings: a coffee rated by two contributors is published, one rated by one is not;
+        # a drinker with three of the published coffees rated is listed, anonymously.
+        def kid_of(private):
+            point = vr._mul(private, vr.G)
+            return vr.key_id(b"\x04" + point[0].to_bytes(32, "big") + point[1].to_bytes(32, "big"))
+        tastes = {"anna": [("portrait/idjwi-island", 5, ["fruity", "floral"]), ("example/ethiopia-guji", 4, ["floral"]),
+                           ("example/kenya-aa", 5, ["fruity"])],
+                  "ben": [("portrait/idjwi-island", 3, ["chocolate"]), ("example/ethiopia-guji", 5, ["floral", "fruity"]),
+                          ("example/kenya-aa", 2, [])],
+                  "cara": [("example/colombia-decaf", 4, ["chocolate"])]}
+        for name, rated in tastes.items():
+            private = EXAMPLE_PEOPLE[name][0]
+            kid = kid_of(private)
+            for n, (library_id, stars, flavours) in enumerate(rated, start=1):
+                entry = next(c for c in EXAMPLE_COFFEES if c["id"] == library_id)
+                body = {"t": "taste", "v": 1, "id": n, "at": "2026-10-21T08:00:00Z",
+                        "coffee": {"library_id": library_id, "name": entry["name"]},
+                        "drinker": 1, "stars": stars, "cup": {"acidity": 3 + n % 3}, "flavours": flavours}
+                vr.check_body(body)
+                os.makedirs(os.path.join(root, "tastes"), exist_ok=True)
+                with open(os.path.join(root, "tastes", f"{kid}-r{n}.json"), "w", encoding="utf-8") as f:
+                    f.write(_envelope(private, kid, body))
+        build(root, log=lambda *_: None)
+        taste = read_json(os.path.join(root, "index", "taste.json"))
+        assert set(taste["coffees"]) == {"portrait/idjwi-island", "example/ethiopia-guji", "example/kenya-aa"}, taste
+        assert taste["coffees"]["example/ethiopia-guji"]["stars"] == 4.5
+        assert taste["coffees"]["example/ethiopia-guji"]["flavours"]["floral"] == 1.0
+        assert taste["coffees"]["portrait/idjwi-island"]["stars_hist"] == [0, 0, 1, 0, 1]
+        assert len(taste["people"]) == 2 and all(len(p["r"]) == 3 for p in taste["people"])
+        assert all("anna" not in json.dumps(p) for p in taste["people"])
         guji = read_json(os.path.join(root, "index", "dialin", "example__ethiopia-guji.json"))
         entry = guji["recipes"][0]
         assert entry["contributors"] == 4 and entry["dose_g"] == 18 and entry["yield_g"] == 36

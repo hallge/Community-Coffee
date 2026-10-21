@@ -71,7 +71,7 @@ jobs:
         run: |
           git config user.name "library intake"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          for part in keys dialins shots status pending index; do
+          for part in keys dialins shots tastes status pending index; do
             if [ -e "$part" ] || git ls-files --error-unmatch "$part" > /dev/null 2>&1; then git add -A -- "$part"; fi
           done
           if git diff --cached --quiet; then

@@ -22,6 +22,7 @@ What happens to a record that passes depends on what it is:
   key      filed under keys/. A key says nothing by itself.
   dial-in  filed under dialins/. A measurement: checked, not reviewed.
   shot     filed under shots/. The same.
+  taste    a coffee rating, filed under tastes/ (a changed rating replaces the earlier one).
   coffee   NOT published. It is parked under pending/, the contributor's
            status file says "review", and the plan lists a pull request to
            open that would add it to catalog/. A person decides.
@@ -268,6 +269,10 @@ def take(inbox, library, log=print):
             report.append((shown, "filed", target))
         elif kind == "shot":
             target = f"shots/{month_folder(body)}/{kid}-{int(body['id'])}.json"
+            write_text(os.path.join(library, target), text)
+            report.append((shown, "filed", target))
+        elif kind == "taste":
+            target = f"tastes/{kid}-r{int(body['id'])}.json"
             write_text(os.path.join(library, target), text)
             report.append((shown, "filed", target))
         elif kind == "grinder":   # a model for the shared list: reviewed, like a coffee

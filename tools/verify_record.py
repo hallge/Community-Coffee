@@ -81,7 +81,10 @@ def ecdsa_verify(public, digest, r, s):
 
 
 # ---- records ----------------------------------------------------------------
-TYPES = ("key", "coffee", "grinder", "machine", "dialin", "shot")
+TYPES = ("key", "coffee", "grinder", "machine", "dialin", "shot", "taste")
+# A coffee rating (docs/COFFEE-TASTE.md in the firmware repository): the cup and the flavour families.
+CUP = ("acidity", "sweetness", "body", "bitterness", "finish")
+FLAVOURS = ("fruity", "floral", "sweet", "chocolate", "spicy", "roasty", "fermented", "earthy")
 MACHINE_STYLES = ("toggle_button", "start_button", "manual", "start_stop_buttons", "hold_button")
 KEY_ID_HEX = 20
 
@@ -231,6 +234,27 @@ def check_body(body):
         _number(result, "shots", 1, 10)
         if result.get("basis") not in ("total", "pour"):
             raise Refused("result.basis is neither total nor pour")
+    elif kind == "taste":
+        # How a drinker liked a coffee (not a shot). The drinker is a number on the controller, never
+        # a name.
+        coffee = body.get("coffee")
+        if not isinstance(coffee, dict):
+            raise Refused("coffee is missing")
+        check_coffee(coffee, full="local_id" in coffee)
+        _number(body, "id", 1, 4294967295)
+        _number(body, "stars", 1, 5)
+        _number(body, "drinker", 0, 8)
+        cup = body.get("cup", {})
+        if not isinstance(cup, dict):
+            raise Refused("cup is not an object")
+        for name in cup:
+            if name not in CUP:
+                raise Refused(f"cup.{name} is not one the controller asks for")
+            _number(cup, name, 1, 5)
+        flavours = body.get("flavours", [])
+        if (not isinstance(flavours, list) or any(f not in FLAVOURS for f in flavours)
+                or len(set(flavours)) != len(flavours)):
+            raise Refused("flavours are not the controller's flavour families")
     elif kind == "shot":
         if "coffee" in body:
             check_coffee(body["coffee"], full="local_id" in body["coffee"])
