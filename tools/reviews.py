@@ -30,12 +30,16 @@ def run(*command, check=True, capture=False):
     return result.stdout if capture else result.returncode
 
 
+# A review branch Intake names: review/<key id>-<c|g|m><local id>-<record> (coffee, grinder, machine).
+REVIEW_BRANCH = r"review/[0-9a-f]{20}-[cgm]\d+-\d+"
+
+
 def open_reviews(plan_path):
     plan = intake.read_json(plan_path, []) or []
     opened = 0
     for item in plan:
         branch = item["branch"]
-        if not re.fullmatch(r"review/[0-9a-f]{20}-[cg]\d+-\d+", branch):
+        if not re.fullmatch(REVIEW_BRANCH, branch):
             print(f"skipped: not a review branch name: {branch!r}")
             continue
         if run("git", "ls-remote", "--exit-code", "--heads", "origin", branch, check=False, capture=True):
@@ -137,6 +141,8 @@ def self_test():
     g = decision(gbody, True, [], ["grinders/home-built-64.json"], listed.get)
     assert g["kind"] == "grinder" and g["library_id"] == "home-built-64" and g["state"] == "published"
     # A machine profile is reviewed the same way.
+    assert all(re.fullmatch(REVIEW_BRANCH, f"review/0123456789abcdef0123-{k}1-12") for k in "cgm")
+    assert not re.fullmatch(REVIEW_BRANCH, "review/0123456789abcdef0123-x1-12")
     mbody = '<!-- intake {"kind":"machine","kid":"0123456789abcdef0123","local_id":1,"record":12} -->'
     mlisted = {"machines/breville-dual-boiler-2-cup-button.json": {"id": "breville-dual-boiler-2-cup-button"}}
     m = decision(mbody, True, [], ["machines/breville-dual-boiler-2-cup-button.json"], mlisted.get)
