@@ -200,6 +200,19 @@ def _link(obj, name, required=True):
     if (not isinstance(value, str) or not value.startswith("https://") or len(value) > limit
             or any(ord(c) <= 0x20 or ord(c) > 0x7E for c in value)):
         raise Refused(f"{name} is not an https link of at most {limit} characters")
+    # Nothing of one customer's: a shop's general page, not someone's portal, login token or tracking.
+    if name in ("image", "icon"):
+        query = value.partition("?")[2].lower()
+        if any(word in query for word in ("token", "key=", "sig", "auth", "session", "password")):
+            raise Refused(f"{name} carries what looks like a credential")
+    else:
+        if "?" in value or "#" in value:
+            raise Refused(f"{name} has a query or fragment: links are to a shop's general pages")
+        path = value[len("https://"):].partition("/")[2]
+        for segment in path.split("/"):
+            mixed = any(c.isdigit() for c in segment) and any(c.isalpha() for c in segment)
+            if "token" in segment.lower() or (len(segment) >= 16 and mixed):
+                raise Refused(f"{name} looks like one customer's own link")
 
 
 def _choices(obj, name, allowed, limit):
@@ -514,6 +527,17 @@ def self_test():
     assert "kind" in refused(envelope(service.replace('"kind":"coffee"', '"kind":"wine"')))
     review = ('{"t":"service_review","v":1,"id":7,"service":"trade-coffee","drinker":2,"stars":5,'
               '"aspects":{"value":4,"consistency":5}}')
+    assert "query" in refused(envelope(service.replace('"https://www.drinktrade.com/account"',
+                                                        '"https://www.drinktrade.com/account?ref=me"')))
+    assert "own link" in refused(envelope(service.replace(
+        '"https://www.drinktrade.com/account"',
+        '"https://shop.example/tools/recurring/portal/0123456789abcdef0123456789ab/subscriptions"')))
+    assert verify(envelope(service.replace('"https://www.drinktrade.com/account"',
+                                           '"https://shopify.com/12345678901/account/orders"')), keys)[0] == "service"
+    assert "credential" in refused(envelope(service.replace('"color":"#aa3311"',
+                                                            '"color":"#aa3311","image":"https://x.example/i.png?token=abc"')))
+    assert verify(envelope(service.replace('"color":"#aa3311"',
+                                           '"color":"#aa3311","image":"https://x.example/i.png?v=17&width=1200"')), keys)[0] == "service"
     assert verify(envelope(review), keys)[0] == "service_review"
     assert "aspects.speed" in refused(envelope(review.replace('"value":4', '"speed":4')))
     assert "listed service" in refused(envelope(review.replace('"trade-coffee"', '"Trade Coffee"')))
