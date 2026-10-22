@@ -23,6 +23,8 @@ What happens to a record that passes depends on what it is:
   dial-in  filed under dialins/. A measurement: checked, not reviewed.
   shot     filed under shots/. The same.
   taste    a coffee rating, filed under tastes/ (a changed rating replaces the earlier one).
+  service_review  a rating of a listed subscription service, filed under svcreviews/ (the same).
+  grinder, machine, service  descriptions for the shared lists: reviewed, like a coffee.
   coffee   NOT published. It is parked under pending/, the contributor's
            status file says "review", and the plan lists a pull request to
            open that would add it to catalog/. A person decides.
@@ -50,6 +52,8 @@ CATALOG_FIELDS = ("name", "roaster", "origin", "region", "producer", "varietal",
 GRINDER_FIELDS = ("model", "burrs", "unit", "um_per_unit", "divisor", "sub_steps")
 MACHINE_FIELDS = ("maker", "model", "control", "style", "manual_start", "hold_preinfusion",
                   "tap_preinfusion", "power_toggle", "self_stop_s")
+SERVICE_FIELDS = ("name", "url", "manage_url", "platform", "kind", "ships_to", "cadences", "price_from_cents",
+                  "currency", "style", "sourcing", "image", "icon", "color", "about")
 NOTE_LIMIT = 47     # what the controller keeps of a reviewer's note
 MAX_RECORD_BYTES = 8192
 
@@ -106,7 +110,7 @@ def set_status(library, kid, local_id, record, state, library_id="", note="", se
     return True
 
 
-STATUS_SECTIONS = {"coffee": "coffees", "grinder": "grinders", "machine": "machines"}
+STATUS_SECTIONS = {"coffee": "coffees", "grinder": "grinders", "machine": "machines", "service": "services"}
 
 
 def tell_refused(library, error):
@@ -200,6 +204,45 @@ def machine_request_text(library, kid, body, proposed_id, exists):
     ])
 
 
+def service_request_text(library, kid, body, proposed_id, exists):
+    def shown(value):
+        return ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
+    rows = "\n".join(f"| {field.replace('_', ' ')} | {shown(body[field])} |" for field in SERVICE_FIELDS
+                     if field in body and field not in ("image", "icon"))
+    existing = sorted(os.path.splitext(os.path.basename(p))[0]
+                      for p in glob.glob(os.path.join(library, "services", "*.json")))
+    close = [e for e in difflib.get_close_matches(proposed_id, existing, n=5, cutoff=0.5) if e != proposed_id]
+    host = re.sub(r"^https://(www\.)?", "", body["url"]).split("/")[0]
+    same_host = []
+    for path in glob.glob(os.path.join(library, "services", "*.json")):
+        entry = read_json(path, {}) or {}
+        if isinstance(entry, dict) and host and host in str(entry.get("url", "")):
+            same_host.append(os.path.splitext(os.path.basename(path))[0])
+    claims = body.get("sourcing", [])
+    meta = json.dumps({"kind": "service", "kid": kid, "local_id": body["local_id"], "record": body["record"],
+                       "library_id": proposed_id}, separators=(",", ":"))
+    return "\n".join([
+        f"A controller's owner has set up this subscription service{' again, changed' if exists else ''}. Its "
+        "record passed the signature and value checks; whether it belongs in the shared list, and whether its "
+        "links and claims are right, is for a person to decide.",
+        "", "| | |", "| --- | --- |", rows, "",
+        f"**Would be listed as** `{proposed_id}`" + (" (this entry exists: merging replaces it)" if exists else ""),
+        "",
+        "**Check against the service's own site:** the links open the shop and its subscription page; where it "
+        "ships; " + ("and each sourcing claim (" + ", ".join(f"`{c}`" for c in claims) + "): remove any it does "
+                     "not show evidence for (a certification, named farms, published prices)." if claims else
+                     "it makes no sourcing claims."),
+        "",
+        "**Similar entries already listed:** " + (", ".join(f"`{s}`" for s in sorted(set(close + same_host))) or
+                                                   "none found."),
+        "",
+        "- **Merge** to list it. Edit the file in this pull request first if anything needs correcting.",
+        f"- **Close** to decline. A last comment starting `Declined:` is shown to the contributor (first {NOTE_LIMIT} characters).",
+        "",
+        f"<!-- intake {meta} -->",
+    ])
+
+
 def grinder_request_text(library, kid, body, proposed_id, exists):
     rows = "\n".join(f"| {field.replace('_', ' ')} | {body[field]} |" for field in GRINDER_FIELDS if field in body)
     existing = sorted(os.path.splitext(os.path.basename(p))[0]
@@ -275,6 +318,31 @@ def take(inbox, library, log=print):
             target = f"tastes/{kid}-r{int(body['id'])}.json"
             write_text(os.path.join(library, target), text)
             report.append((shown, "filed", target))
+        elif kind == "service_review":
+            target = f"svcreviews/{kid}-v{int(body['id'])}.json"
+            write_text(os.path.join(library, target), text)
+            report.append((shown, "filed", target))
+        elif kind == "service":   # a subscription service for the shared list: reviewed, like a machine
+            local_id, record = body["local_id"], body["record"]
+            pending = f"pending/services/{kid}/s{local_id}-{record}.json"
+            if not set_status(library, kid, local_id, record, "review", section="services"):
+                report.append((shown, "refused", "an earlier version of a service that has been sent again since"))
+                continue
+            write_text(os.path.join(library, pending), text)
+            proposed = (slug(body["name"])[:39].strip("-")) or "unnamed"
+            listed_path = f"services/{proposed}.json"
+            exists = os.path.exists(os.path.join(library, listed_path))
+            entry = {"id": proposed}
+            entry.update({field: body[field] for field in SERVICE_FIELDS if field in body})
+            plan.append({
+                "branch": f"review/{kid}-s{local_id}-{record}",
+                "title": f"{'Change' if exists else 'Add'} subscription service: {body['name']}",
+                "body": service_request_text(library, kid, body, proposed, exists),
+                "catalog_path": listed_path,
+                "catalog_text": json.dumps(entry, indent=1) + "\n",
+                "pending_path": pending,
+            })
+            report.append((shown, "for review", listed_path))
         elif kind == "grinder":   # a model for the shared list: reviewed, like a coffee
             local_id, record = body["local_id"], body["record"]
             pending = f"pending/grinders/{kid}/g{local_id}-{record}.json"
@@ -482,6 +550,34 @@ def self_test():
         assert read_json(os.path.join(library, "index", "grinders.json"))["grinders"] == [
             {"id": "home-built-64", "model": "Home Built 64", "burrs": "64 mm flat", "unit": "dial"}]
     assert slug("Café  Olé!") == "caf-ol" and catalog_id({"name": "X"}) == "unknown/x"
+
+    # A subscription service goes to review; a review of a service is filed; a bad service is refused
+    # and the owner told why.
+    service = {"t": "service", "v": 1, "record": 41, "local_id": 3, "name": "Trade Coffee",
+               "url": "https://www.drinktrade.com/", "manage_url": "https://www.drinktrade.com/account",
+               "platform": "ordergroove", "kind": "coffee", "ships_to": ["US"], "cadences": [14, 28],
+               "sourcing": ["fair_trade"]}
+    with tempfile.TemporaryDirectory() as root:
+        inbox, library = os.path.join(root, "inbox"), os.path.join(root, "library")
+        os.makedirs(library)
+        write_text(os.path.join(inbox, "k.json"), bi._envelope(anna[0], anna[1], {"t": "key", "v": 1, "alg": "ES256", "key": anna[2]}))
+        write_text(os.path.join(inbox, "s.json"), bi._envelope(anna[0], anna[1], service))
+        write_text(os.path.join(inbox, "r.json"), bi._envelope(anna[0], anna[1], {
+            "t": "service_review", "v": 1, "id": 7, "service": "trade-coffee", "drinker": 1, "stars": 5,
+            "aspects": {"value": 4}}))
+        bad = dict(service, local_id=4, record=42, sourcing=["free_beer"])
+        write_text(os.path.join(inbox, "bad.json"), bi._envelope(anna[0], anna[1], bad))
+        plan, report = take(inbox, library, log=lambda *_: None)
+        outcome = {name: (what, detail) for name, what, detail in report}
+        assert outcome["s.json"] == ("for review", "services/trade-coffee.json")
+        assert outcome["r.json"] == ("filed", f"svcreviews/{anna[1]}-v7.json")
+        assert outcome["bad.json"][0] == "refused"
+        splan = [p for p in plan if p["branch"] == f"review/{anna[1]}-s3-41"][0]
+        assert splan["title"] == "Add subscription service: Trade Coffee" and "`fair_trade`" in splan["body"]
+        assert json.loads(splan["catalog_text"])["id"] == "trade-coffee"
+        assert "local_id" not in json.loads(splan["catalog_text"])
+        status = read_json(os.path.join(library, "status", anna[1] + ".json"))
+        assert {e["local_id"]: e["state"] for e in status["services"]} == {3: "review", 4: "refused"}
     print("self-test passed")
 
 

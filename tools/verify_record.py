@@ -81,11 +81,20 @@ def ecdsa_verify(public, digest, r, s):
 
 
 # ---- records ----------------------------------------------------------------
-TYPES = ("key", "coffee", "grinder", "machine", "dialin", "shot", "taste")
+TYPES = ("key", "coffee", "grinder", "machine", "dialin", "shot", "taste", "service", "service_review")
 # A coffee rating (docs/COFFEE-TASTE.md in the firmware repository): the cup and the flavour families.
 CUP = ("acidity", "sweetness", "body", "bitterness", "finish")
 FLAVOURS = ("fruity", "floral", "sweet", "chocolate", "spicy", "roasty", "fermented", "earthy")
 MACHINE_STYLES = ("toggle_button", "start_button", "manual", "start_stop_buttons", "hold_button")
+# Subscription services (docs/SUBSCRIPTIONS.md in the firmware repository). The lists are the firmware's
+# (src/core/Subscriptions.h), in the same order.
+SERVICE_KINDS = ("coffee", "supplies", "other")
+SERVICE_STYLES = ("single_roaster", "multi_roaster", "curated", "matched", "single_origin", "blends", "decaf",
+                  "espresso", "filters", "cleaning", "equipment")
+SERVICE_SOURCING = ("fair_trade", "direct_trade", "organic", "farm_named", "prices_published",
+                    "sustainable_packaging", "carbon_neutral", "b_corp")
+SERVICE_PLATFORMS = ("recharge", "ordergroove", "skio", "loop", "appstle", "bold", "shopify", "own")
+SERVICE_ASPECTS = ("value", "quality", "consistency", "reliability", "flexibility", "transparency")
 KEY_ID_HEX = 20
 
 
@@ -180,6 +189,73 @@ def check_grinder(g):
     _number(g, "calibration", 0, 65535)
 
 
+def _link(obj, name, required=True):
+    """A web link: https, printable, no spaces, at most 199 characters (255 for pictures)."""
+    if name not in obj:
+        if required:
+            raise Refused(f"{name} is missing")
+        return
+    value = obj[name]
+    limit = 255 if name in ("image", "icon") else 199
+    if (not isinstance(value, str) or not value.startswith("https://") or len(value) > limit
+            or any(ord(c) <= 0x20 or ord(c) > 0x7E for c in value)):
+        raise Refused(f"{name} is not an https link of at most {limit} characters")
+
+
+def _choices(obj, name, allowed, limit):
+    if name not in obj:
+        return
+    value = obj[name]
+    if (not isinstance(value, list) or not value or len(value) > limit or len(set(value)) != len(value)
+            or any(v not in allowed for v in value)):
+        raise Refused(f"{name} is not a list taken from the controller's own")
+
+
+def check_service(s, full=True):
+    """A subscription service. full: as a controller sends it; else as the library lists it."""
+    _text(s, "name", 47)
+    _link(s, "url")
+    _link(s, "manage_url", required=False)
+    if "platform" in s and s["platform"] not in SERVICE_PLATFORMS:
+        raise Refused("platform is not one the controller knows")
+    if s.get("kind") not in SERVICE_KINDS:
+        raise Refused("kind is not coffee, supplies or other")
+    ships = s.get("ships_to", [])
+    if "ships_to" in s and (not isinstance(ships, list) or not ships or len(ships) > 10 or len(set(ships)) != len(ships)
+                            or any(not (isinstance(c, str) and len(c) == 2 and c.isascii() and c.isupper())
+                                   for c in ships)):
+        raise Refused("ships_to is not a list of two-letter country codes")
+    cadences = s.get("cadences", [])
+    if "cadences" in s and (not isinstance(cadences, list) or not cadences or len(cadences) > 6
+                            or any(isinstance(d, bool) or not isinstance(d, int) or not 1 <= d <= 366 for d in cadences)):
+        raise Refused("cadences are not days from 1 to 366")
+    if ("price_from_cents" in s) != ("currency" in s):
+        raise Refused("a typical price needs its currency, and a currency its price")
+    if "price_from_cents" in s:
+        _number(s, "price_from_cents", 1, 1000000)
+        currency = s["currency"]
+        if not (isinstance(currency, str) and len(currency) == 3 and currency.isascii() and currency.isupper()):
+            raise Refused("currency is not a three-letter code")
+    _choices(s, "style", SERVICE_STYLES, len(SERVICE_STYLES))
+    _choices(s, "sourcing", SERVICE_SOURCING, len(SERVICE_SOURCING))
+    _link(s, "image", required=False)
+    _link(s, "icon", required=False)
+    if "color" in s and not (isinstance(s["color"], str) and len(s["color"]) == 7 and s["color"][0] == "#"
+                             and all(c in "0123456789abcdefABCDEF" for c in s["color"][1:])):
+        raise Refused("color is not #rrggbb")
+    _text(s, "about", 160, required=False)
+    if full:
+        _number(s, "local_id", 1, 65535)
+        _number(s, "record", 0, 4294967295)
+
+
+def _service_id(obj, name):
+    value = obj.get(name)
+    if (not isinstance(value, str) or not value or len(value) > 39
+            or any(not (c.islower() or c.isdigit() or c == "-") for c in value)):
+        raise Refused(f"{name} is not the id of a listed service")
+
+
 def check_machine(m, full=True):
     """How an espresso machine is worked. full: a description for the shared list; else as a shot carries it."""
     if m.get("style") not in MACHINE_STYLES:
@@ -234,9 +310,27 @@ def check_body(body):
         _number(result, "shots", 1, 10)
         if result.get("basis") not in ("total", "pour"):
             raise Refused("result.basis is neither total nor pour")
+    elif kind == "service":
+        # A subscription service set up by its owner, for a reviewer. Never the owner's own price or dates.
+        check_service(body)
+    elif kind == "service_review":
+        # How a drinker rated a listed service: stars and aspects. The drinker is a number, never a name.
+        _number(body, "id", 1, 4294967295)
+        _service_id(body, "service")
+        _number(body, "stars", 1, 5)
+        _number(body, "drinker", 0, 8)
+        aspects = body.get("aspects", {})
+        if not isinstance(aspects, dict):
+            raise Refused("aspects is not an object")
+        for name in aspects:
+            if name not in SERVICE_ASPECTS:
+                raise Refused(f"aspects.{name} is not one the controller asks for")
+            _number(aspects, name, 1, 5)
     elif kind == "taste":
         # How a drinker liked a coffee (not a shot). The drinker is a number on the controller, never
-        # a name.
+        # a name. service: the listed subscription service the bag came with, if any.
+        if "service" in body:
+            _service_id(body, "service")
         coffee = body.get("coffee")
         if not isinstance(coffee, dict):
             raise Refused("coffee is missing")
@@ -407,6 +501,26 @@ def self_test():
     assert "unknown record type" in refused(envelope('{"t":"other","v":1}'))
     assert "missing" in refused(envelope('{"t":"coffee","v":1,"local_id":4,"record":7}'))
     assert "record is missing" in refused(envelope(coffee.replace('"record":7,', '')))
+    # A subscription service, and a review of one.
+    service = ('{"t":"service","v":1,"record":41,"local_id":3,"name":"Trade Coffee","url":"https://www.drinktrade.com/",'
+               '"manage_url":"https://www.drinktrade.com/account","platform":"ordergroove","kind":"coffee",'
+               '"ships_to":["US"],"cadences":[14,28],"price_from_cents":1500,"currency":"USD",'
+               '"style":["multi_roaster","matched"],"sourcing":["fair_trade"],"color":"#aa3311"}')
+    assert verify(envelope(service), keys)[0] == "service"
+    assert "https" in refused(envelope(service.replace('"https://www.drinktrade.com/account"', '"javascript:x"')))
+    assert "country" in refused(envelope(service.replace('["US"]', '["usa"]')))
+    assert "controller's own" in refused(envelope(service.replace('"fair_trade"', '"free_beer"')))
+    assert "currency" in refused(envelope(service.replace(',"currency":"USD"', "")))
+    assert "kind" in refused(envelope(service.replace('"kind":"coffee"', '"kind":"wine"')))
+    review = ('{"t":"service_review","v":1,"id":7,"service":"trade-coffee","drinker":2,"stars":5,'
+              '"aspects":{"value":4,"consistency":5}}')
+    assert verify(envelope(review), keys)[0] == "service_review"
+    assert "aspects.speed" in refused(envelope(review.replace('"value":4', '"speed":4')))
+    assert "listed service" in refused(envelope(review.replace('"trade-coffee"', '"Trade Coffee"')))
+    taste = ('{"t":"taste","v":1,"id":3,"coffee":{"name":"Alma"},"service":"trade-coffee","drinker":0,'
+             '"stars":4,"cup":{},"flavours":[]}')
+    assert verify(envelope(taste), keys)[0] == "taste"
+    assert "listed service" in refused(envelope(taste.replace('"trade-coffee"', '"../x"')))
     print("self-test passed")
 
 

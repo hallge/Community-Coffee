@@ -14,7 +14,10 @@ Reads, under the root:
 Writes, under root/index:
     coffees.json                        every published coffee, for searching
     taste.json                          coffee ratings: each coffee's taste (from 2 contributors),
-                                        and anonymous drinkers' stars, for recommendations
+                                        and anonymous drinkers' stars, for recommendations; per
+                                        subscription service, the taste of the coffees it sent
+    services.json                       listed subscription services, with their reviews (from 2
+                                        contributors)
     dialin/<coffee file>.json           what contributors settled on for one coffee
     fit/<key id>.json                   how each contributor's grinder sits against the common scale
 
@@ -214,6 +217,8 @@ def build_taste(root, min_contributors=2, log=print):
         key = taste_key(body["coffee"], kid, published)
         if key:
             ratings.append((key, kid, int(body.get("drinker", 0)), body))
+    listed_services = set(os.path.splitext(os.path.basename(p))[0]
+                          for p in glob.glob(os.path.join(root, "services", "*.json")))
     by_coffee = {}
     for key, kid, drinker, body in ratings:
         by_coffee.setdefault(key, []).append((kid, drinker, body))
@@ -236,13 +241,90 @@ def build_taste(root, min_contributors=2, log=print):
                         "stars": round(statistics.fmean(stars), 2),
                         "stars_hist": [stars.count(n) for n in range(1, 6)],
                         "cup": cup, "flavours": flavours}
+    # Per listed subscription service: how the coffees it sent tasted, once enough people rated them.
+    by_service = {}
+    for key, kid, drinker, body in ratings:
+        if body.get("service") in listed_services:
+            by_service.setdefault(body["service"], []).append((kid, drinker, body))
+    services = {}
+    for sid, rs in sorted(by_service.items()):
+        if len({kid for kid, _, _ in rs}) < min_contributors:
+            continue
+        stars = [int(b["stars"]) for _, _, b in rs]
+        cup = {}
+        for name in vr.CUP:
+            values = [b["cup"][name] for _, _, b in rs if name in b.get("cup", {})]
+            if len(values) >= 2:
+                cup[name] = round(statistics.fmean(values), 2)
+        tasted = [b.get("flavours", []) for _, _, b in rs if b.get("flavours")]
+        flavours = ({name: round(sum(name in f for f in tasted) / len(tasted), 2) for name in vr.FLAVOURS}
+                    if len(tasted) >= 2 else {})
+        services[sid] = {"n": len(rs), "contributors": len({kid for kid, _, _ in rs}),
+                         "stars": round(statistics.fmean(stars), 2), "cup": cup, "flavours": flavours}
     people = {}
     for key, kid, drinker, body in ratings:
         if key in coffees:
             person = hashlib.sha256(f"{kid}/{drinker}".encode()).hexdigest()[:12]
             people.setdefault(person, {})[key] = int(body["stars"])
-    people = [{"id": p, "r": r} for p, r in sorted(people.items()) if len(r) >= 3]
-    return {"v": 1, "coffees": coffees, "people": people}
+    # A drinker's liking for a service: the mean of their stars for the coffees it sent ("svc:<id>").
+    liking = {}
+    for key, kid, drinker, body in ratings:
+        sid = body.get("service")
+        if sid in services:
+            person = hashlib.sha256(f"{kid}/{drinker}".encode()).hexdigest()[:12]
+            liking.setdefault((person, sid), []).append(int(body["stars"]))
+    for (person, sid), stars in liking.items():
+        if person in people:
+            people[person]["svc:" + sid] = round(statistics.fmean(stars))
+    people = [{"id": p, "r": r} for p, r in sorted(people.items())
+              if sum(not k.startswith("svc:") for k in r) >= 3]
+    return {"v": 1, "coffees": coffees, "people": people, "services": services}
+
+
+def build_services(root, min_contributors=2, log=print):
+    """index/services.json: the subscription services reviewers have listed, each with what people who
+    use it think of it, once at least `min_contributors` controllers have reviewed it."""
+    keys = vr.load_keys(os.path.join(root, "keys"))
+    listed = []
+    for path in sorted(glob.glob(os.path.join(root, "services", "*.json"))):
+        try:
+            entry = read_json(path)
+            vr.check_service(entry, full=False)
+            sid = entry.get("id")
+            if (not isinstance(sid, str) or not sid or len(sid) > 39 or sid != os.path.splitext(os.path.basename(path))[0]
+                    or any(not (c.islower() or c.isdigit() or c == "-") for c in sid)):
+                raise vr.Refused("id is not the file's plain lower-case name")
+            listed.append({k: entry[k] for k in ("id",) + tuple(f for f in (
+                "name", "url", "manage_url", "platform", "kind", "ships_to", "cadences", "price_from_cents",
+                "currency", "style", "sourcing", "image", "icon", "color", "about")) if k in entry})
+        except (vr.Refused, ValueError, OSError, AttributeError, TypeError, KeyError) as error:
+            log(f"service entry ignored: {path}: {error}")
+    ids = {s["id"] for s in listed}
+    reviews = {}
+    for path in sorted(glob.glob(os.path.join(root, "svcreviews", "*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                kind, kid, body = vr.verify(f.read(), keys)
+            if kind != "service_review" or body["service"] not in ids:
+                continue
+        except (vr.Refused, ValueError, KeyError, OSError) as error:
+            log(f"skipped {path}: {error}")
+            continue
+        reviews.setdefault(body["service"], []).append((kid, body))
+    for service in listed:
+        rs = reviews.get(service["id"], [])
+        if len({kid for kid, _ in rs}) < min_contributors:
+            continue    # too few people: nothing published about it
+        stars = [int(b["stars"]) for _, b in rs]
+        aspects = {}
+        for name in vr.SERVICE_ASPECTS:
+            values = [b["aspects"][name] for _, b in rs if name in b.get("aspects", {})]
+            if len(values) >= 2:
+                aspects[name] = round(statistics.fmean(values), 2)
+        service["reviews"] = {"n": len(rs), "contributors": len({kid for kid, _ in rs}),
+                              "stars": round(statistics.fmean(stars), 2),
+                              "stars_hist": [stars.count(n) for n in range(1, 6)], "aspects": aspects}
+    return {"v": 1, "services": listed}
 
 
 def collapse(observations):
@@ -639,6 +721,9 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
 
     # Coffee ratings.
     write(os.path.join(out, "taste.json"), build_taste(root, min_contributors, log))
+
+    # Subscription services reviewers have listed, and what their users think of them.
+    write(os.path.join(out, "services.json"), build_services(root, min_contributors, log))
 
     # How fast the grind follows the coffee's age.
     aging = {"v": 1, "pairs": pairs}
@@ -1053,6 +1138,41 @@ def self_test():
         assert taste["coffees"]["portrait/idjwi-island"]["stars_hist"] == [0, 0, 1, 0, 1]
         assert len(taste["people"]) == 2 and all(len(p["r"]) == 3 for p in taste["people"])
         assert all("anna" not in json.dumps(p) for p in taste["people"])
+        # Subscription services: listed by a reviewer; reviewed by two contributors (published) and the
+        # coffees they sent rated by two (a service taste, and each drinker's liking for it).
+        os.makedirs(os.path.join(root, "services"), exist_ok=True)
+        with open(os.path.join(root, "services", "trade-coffee.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "trade-coffee", "name": "Trade Coffee", "url": "https://www.drinktrade.com/",
+                       "kind": "coffee", "ships_to": ["US"], "sourcing": ["fair_trade"]}, f)
+        with open(os.path.join(root, "services", "Bad Name.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "Bad Name", "name": "x", "url": "https://x.example/", "kind": "coffee"}, f)
+        os.makedirs(os.path.join(root, "svcreviews"), exist_ok=True)
+        for name, stars, value in (("anna", 5, 4), ("ben", 3, 2), ("cara", 4, None)):
+            private = EXAMPLE_PEOPLE[name][0]
+            kid = kid_of(private)
+            body = {"t": "service_review", "v": 1, "id": 1, "service": "trade-coffee", "drinker": 1, "stars": stars,
+                    "aspects": {"value": value} if value else {}}
+            with open(os.path.join(root, "svcreviews", f"{kid}-v1.json"), "w", encoding="utf-8") as f:
+                f.write(_envelope(private, kid, body))
+        for name in ("anna", "ben"):
+            private = EXAMPLE_PEOPLE[name][0]
+            kid = kid_of(private)
+            path = os.path.join(root, "tastes", f"{kid}-r1.json")
+            with open(path, encoding="utf-8") as f:
+                body = json.loads(json.loads(f.read())["body"])
+            body["service"] = "trade-coffee"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(_envelope(private, kid, body))
+        build(root, log=lambda *_: None)
+        services = read_json(os.path.join(root, "index", "services.json"))["services"]
+        assert [s["id"] for s in services] == ["trade-coffee"], services
+        assert services[0]["reviews"]["n"] == 3 and services[0]["reviews"]["stars"] == 4.0
+        assert services[0]["reviews"]["aspects"] == {"value": 3.0}, services[0]["reviews"]
+        taste = read_json(os.path.join(root, "index", "taste.json"))
+        assert taste["services"]["trade-coffee"]["n"] == 2 and taste["services"]["trade-coffee"]["stars"] == 4.0
+        likes = sorted(p["r"].get("svc:trade-coffee") for p in taste["people"])
+        assert likes == [3, 5], taste["people"]
+        assert len(taste["people"]) == 2
         guji = read_json(os.path.join(root, "index", "dialin", "example__ethiopia-guji.json"))
         entry = guji["recipes"][0]
         assert entry["contributors"] == 4 and entry["dose_g"] == 18 and entry["yield_g"] == 36

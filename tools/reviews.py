@@ -30,8 +30,9 @@ def run(*command, check=True, capture=False):
     return result.stdout if capture else result.returncode
 
 
-# A review branch Intake names: review/<key id>-<c|g|m><local id>-<record> (coffee, grinder, machine).
-REVIEW_BRANCH = r"review/[0-9a-f]{20}-[cgm]\d+-\d+"
+# A review branch Intake names: review/<key id>-<c|g|m|s><local id>-<record> (coffee, grinder, machine,
+# subscription service).
+REVIEW_BRANCH = r"review/[0-9a-f]{20}-[cgms]\d+-\d+"
 
 
 def open_reviews(plan_path):
@@ -78,8 +79,8 @@ def decision(body, merged, comments, files, read_catalog):
         return None
     if not re.fullmatch(r"[0-9a-f]{20}", str(kid)):
         return None
-    kind = meta.get("kind") if meta.get("kind") in ("grinder", "machine") else "coffee"
-    folder = {"grinder": "grinders/", "machine": "machines/"}.get(kind, "catalog/")
+    kind = meta.get("kind") if meta.get("kind") in ("grinder", "machine", "service") else "coffee"
+    folder = {"grinder": "grinders/", "machine": "machines/", "service": "services/"}.get(kind, "catalog/")
     result = {"kind": kind, "kid": kid, "local_id": local_id, "record": record}
     if merged:
         # The reviewer may have renamed the entry: go by what was merged.
@@ -113,8 +114,8 @@ def close_review():
     if result is None:
         print("not a review pull request, or nothing was published: status left alone")
         return
-    section, letter = {"grinder": ("grinders", "g"), "machine": ("machines", "m")}.get(result["kind"],
-                                                                                       ("coffees", "c"))
+    section, letter = {"grinder": ("grinders", "g"), "machine": ("machines", "m"),
+                       "service": ("services", "s")}.get(result["kind"], ("coffees", "c"))
     changed = intake.set_status(".", result["kid"], result["local_id"], result["record"],
                                 result["state"], result["library_id"], result["note"], section)
     pending = f"pending/{section}/{result['kid']}/{letter}{result['local_id']}-{result['record']}.json"
@@ -149,6 +150,12 @@ def self_test():
     assert m["kind"] == "machine" and m["library_id"] == "breville-dual-boiler-2-cup-button" and m["state"] == "published"
     m = decision(mbody, False, ["declined: the 2 CUP button is volumetric"], [], mlisted.get)
     assert m["kind"] == "machine" and m["state"] == "declined" and m["note"] == "the 2 CUP button is volumetric"
+    # A subscription service too.
+    sbody = '<!-- intake {"kind":"service","kid":"0123456789abcdef0123","local_id":3,"record":41} -->'
+    slisted = {"services/trade-coffee.json": {"id": "trade-coffee", "name": "Trade Coffee"}}
+    sv = decision(sbody, True, [], ["services/trade-coffee.json"], slisted.get)
+    assert sv["kind"] == "service" and sv["library_id"] == "trade-coffee" and sv["state"] == "published"
+    assert re.fullmatch(REVIEW_BRANCH, "review/0123456789abcdef0123-s3-41")
     assert decision(gbody, True, [], ["catalog/portrait/idjwi-island.json"], catalog.get) is None   # wrong folder
     assert decision(body.replace("0123456789abcdef0123", "../../etc"), True, [], [], catalog.get) is None
     assert decision('<!-- intake {"kid":1} -->', False, [], [], catalog.get) is None
