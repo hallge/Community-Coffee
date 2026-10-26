@@ -62,8 +62,14 @@ def slug(text):
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
 
 
+CATALOG_ID_MAX = 39  # the controller keeps 39 characters of a library id (LIBRARY_ID_LEN)
+
+
 def catalog_id(coffee):
-    return f"{slug(coffee.get('roaster')) or 'unknown'}/{slug(coffee['name']) or 'unnamed'}"
+    roaster = (slug(coffee.get("roaster")) or "unknown")[:20].strip("-") or "unknown"
+    name = slug(coffee["name"]) or "unnamed"
+    name = name[:CATALOG_ID_MAX - len(roaster) - 1].strip("-") or "unnamed"
+    return f"{roaster}/{name}"
 
 
 def month_folder(body):
@@ -285,7 +291,12 @@ def take(inbox, library, log=print):
             loaded.append((path, None, str(error), False))
             continue
         loaded.append((path, text, None, is_key))
-    loaded.sort(key=lambda item: not item[3])    # keys first: the rest of a batch needs them
+    # Keys first: the rest of a batch needs them. Then by the sender's record number, so that of two
+    # versions of one rating in a batch the later is filed last and stays.
+    def order(item):
+        number = re.search(r"-(\d+)\.json$", item[0])
+        return (not item[3], int(number.group(1)) if number else 0, item[0])
+    loaded.sort(key=order)
 
     plan, report = [], []
     for path, text, problem, _ in loaded:
@@ -550,6 +561,8 @@ def self_test():
         assert read_json(os.path.join(library, "index", "grinders.json"))["grinders"] == [
             {"id": "home-built-64", "model": "Home Built 64", "burrs": "64 mm flat", "unit": "dial"}]
     assert slug("Café  Olé!") == "caf-ol" and catalog_id({"name": "X"}) == "unknown/x"
+    long_id = catalog_id({"roaster": "Onyx Coffee Lab of Northwest Arkansas", "name": "Ethiopia Yirgacheffe Konga Natural"})
+    assert len(long_id) <= CATALOG_ID_MAX and long_id.startswith("onyx-coffee-lab-of-n") and not long_id.endswith("-"), long_id
 
     # A subscription service goes to review; a review of a service is filed; a bad service is refused
     # and the owner told why.

@@ -1,0 +1,10 @@
+{
+ "id": "timemore-c3",
+ "model": "Timemore Chestnut C3",
+ "burrs": "38 mm conical",
+ "unit": "click",
+ "model_id": 19,
+ "min": 1,
+ "max": 36,
+ "source": "Steps as marked on the grinder; microns per step not published: learned from owners' shots."
+}

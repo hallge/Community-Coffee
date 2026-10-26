@@ -1,0 +1,11 @@
+{
+ "id": "baratza-sette-270",
+ "model": "Baratza Sette 270 / 270Wi",
+ "burrs": "40 mm conical",
+ "unit": "setting",
+ "model_id": 11,
+ "sub_steps": 9,
+ "min": 1,
+ "max": 279,
+ "source": "Macro 1-31, micro A-I (9 steps each), read as macro:micro."
+}

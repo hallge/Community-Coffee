@@ -1,0 +1,10 @@
+{
+ "id": "baratza-sette-30",
+ "model": "Baratza Sette 30",
+ "burrs": "40 mm conical",
+ "unit": "setting",
+ "model_id": 12,
+ "min": 1,
+ "max": 30,
+ "source": "Steps as marked on the grinder; microns per step not published: learned from owners' shots."
+}

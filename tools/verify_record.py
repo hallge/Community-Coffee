@@ -339,6 +339,12 @@ def check_body(body):
             if name not in SERVICE_ASPECTS:
                 raise Refused(f"aspects.{name} is not one the controller asks for")
             _number(aspects, name, 1, 5)
+    elif kind == "taste" and body.get("withdrawn") is True:
+        # The owner deleted this rating: it replaces the one with this id, and counts for nothing.
+        _number(body, "id", 1, 4294967295)
+        extra = set(body) - {"t", "v", "id", "at", "withdrawn"}
+        if extra:
+            raise Refused(f"a withdrawal holds only its id, not {sorted(extra)}")
     elif kind == "taste":
         # How a drinker liked a coffee (not a shot). The drinker is a number on the controller, never
         # a name. service: the listed subscription service the bag came with, if any.
@@ -512,6 +518,10 @@ def self_test():
     assert verify(envelope(grinder), keys)[0] == "grinder"
     assert "unit is missing" in refused(envelope(grinder.replace(',"unit":"dial"', "")))
     assert "unknown record type" in refused(envelope('{"t":"other","v":1}'))
+    # A deleted rating, withdrawn: its id and nothing about the coffee or the drinker.
+    withdrawn = '{"t":"taste","v":1,"id":42,"at":"2026-10-26T10:00:00Z","withdrawn":true}'
+    assert verify(envelope(withdrawn), keys)[0] == "taste"
+    assert "only its id" in refused(envelope(withdrawn.replace('"withdrawn"', '"stars":5,"withdrawn"')))
     assert "missing" in refused(envelope('{"t":"coffee","v":1,"local_id":4,"record":7}'))
     assert "record is missing" in refused(envelope(coffee.replace('"record":7,', '')))
     # A subscription service, and a review of one.

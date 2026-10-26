@@ -1,0 +1,10 @@
+{
+ "id": "breville-barista-express",
+ "model": "Breville Barista Express",
+ "burrs": "conical (built in)",
+ "unit": "setting",
+ "model_id": 7,
+ "min": 1,
+ "max": 16,
+ "source": "Steps as marked on the grinder; microns per step not published: learned from owners' shots."
+}

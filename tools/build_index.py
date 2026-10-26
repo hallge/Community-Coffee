@@ -47,6 +47,7 @@ import argparse
 import base64
 import glob
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -56,6 +57,8 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import verify_record as vr  # noqa: E402
+
+INDEX_WARN_BYTES = 57344  # 56 kB: controllers read an index file into 64 kB (LIBRARY_TEXT_SIZE)
 
 MIN_ITEMS_FOR_SCALE = 3     # coffees in common before an unmarked dial's scale is fitted
 # Bean age. As roasted coffee ages a shot runs faster at the same grind, so its owner grinds
@@ -124,9 +127,25 @@ def read_json(path):
         return json.load(f)
 
 
+def model_numbers(root):
+    """The firmware's model numbers mapped to their entries in the library's list of grinders (each
+    built-in is seeded as an entry with its model_id), so a dial-in that names its grinder only by
+    number pools with those that name the entry: one model, one key."""
+    numbers = {}
+    for path in glob.glob(os.path.join(root, "grinders", "*.json")):
+        try:
+            entry = read_json(path)
+            if isinstance(entry.get("model_id"), int) and entry["model_id"] > 0 and library_file(entry.get("id")):
+                numbers[entry["model_id"]] = entry["id"]
+        except (ValueError, OSError, AttributeError):
+            pass
+    return numbers
+
+
 def load_observations(root, accept_unsigned=False, log=print):
     """Returns a list of dicts, one per accepted dial-in."""
     keys = vr.load_keys(os.path.join(root, "keys"))
+    numbers = model_numbers(root)
     published = {}   # (kid, local id) -> library id
     for path in glob.glob(os.path.join(root, "status", "*.json")):
         kid = os.path.splitext(os.path.basename(path))[0]
@@ -167,8 +186,10 @@ def load_observations(root, accept_unsigned=False, log=print):
             "um_per_unit": grinder.get("um_per_unit", 0) or 0,
             "model_id": grinder.get("model_id", 0) or 0,
             # The same model, for comparing owners of one: the library's entry if it has
-            # one, else the firmware's own number for it.
-            "model_key": grinder.get("library_id") or (grinder.get("model_id", 0) or 0),
+            # one (named in the record, or the entry the firmware's number is listed as), else the
+            # firmware's own number for it.
+            "model_key": (grinder.get("library_id") or numbers.get(grinder.get("model_id", 0) or 0)
+                          or (grinder.get("model_id", 0) or 0)),
             "item": (library_id, recipe_class(body["recipe"])),
             "setting": float(body["grind"]),
             "time_s": float(body["result"]["time_s"]),
@@ -181,13 +202,33 @@ def load_observations(root, accept_unsigned=False, log=print):
     return observations
 
 
+KEY_PART = 24   # the controller's COFFEE_KEY_PART (src/net/Web.cpp tasteKey): 23 characters a part
+
+
+def key_part(text):
+    """Lower case, runs of spaces as one, none at the ends, at most 23 characters: exactly as the
+    controller's tasteKey squeezes a roaster or a name, so the two keys match."""
+    out, space = [], False
+    for c in str(text or ""):
+        if len(out) + 1 >= KEY_PART:
+            break
+        if c.isspace():
+            space = len(out) > 0
+            continue
+        if space and len(out) + 2 < KEY_PART:
+            out.append(" ")
+        space = False
+        out.append(c.lower() if c.isascii() else c)
+    return "".join(out)
+
+
 def taste_key(coffee, kid, published):
     """The coffee a rating is about: its library entry, else its roaster and name."""
     library_id = coffee.get("library_id") or published.get((kid, coffee.get("local_id")))
     if library_file(library_id):
         return library_id
-    roaster = " ".join(str(coffee.get("roaster", "")).lower().split())
-    name = " ".join(str(coffee.get("name", "")).lower().split())
+    roaster = key_part(coffee.get("roaster", ""))
+    name = key_part(coffee.get("name", ""))
     return f"~{roaster}/{name}" if name else None
 
 
@@ -209,8 +250,8 @@ def build_taste(root, min_contributors=2, log=print):
         try:
             with open(path, encoding="utf-8") as f:
                 kind, kid, body = vr.verify(f.read(), keys)
-            if kind != "taste":
-                continue
+            if kind != "taste" or body.get("withdrawn"):
+                continue    # a withdrawn rating counts for nothing
         except (vr.Refused, ValueError, KeyError, OSError) as error:
             log(f"skipped {path}: {error}")
             continue
@@ -261,17 +302,28 @@ def build_taste(root, min_contributors=2, log=print):
                     if len(tasted) >= 2 else {})
         services[sid] = {"n": len(rs), "contributors": len({kid for kid, _, _ in rs}),
                          "stars": round(statistics.fmean(stars), 2), "cup": cup, "flavours": flavours}
+    # Who is who stays in the library: a keyed hash, the key from the build's secrets (BBW_PEOPLE_SALT).
+    # Without it a fixed key, so the file does not change at every build; the ids are then traceable.
+    salt = os.environ.get("BBW_PEOPLE_SALT", "").encode()
+    if not salt:
+        salt = b"bbw-people-unsalted"
+        if ratings:
+            log("warning: BBW_PEOPLE_SALT is not set: drinker ids in index/taste.json can be traced to keys")
+
+    def person_of(kid, drinker):
+        return hmac.new(salt, f"{kid}/{drinker}".encode(), hashlib.sha256).hexdigest()[:12]
+
     people = {}
     for key, kid, drinker, body in ratings:
         if key in coffees:
-            person = hashlib.sha256(f"{kid}/{drinker}".encode()).hexdigest()[:12]
+            person = person_of(kid, drinker)
             people.setdefault(person, {})[key] = int(body["stars"])
     # A drinker's liking for a service: the mean of their stars for the coffees it sent ("svc:<id>").
     liking = {}
     for key, kid, drinker, body in ratings:
         sid = body.get("service")
         if sid in services:
-            person = hashlib.sha256(f"{kid}/{drinker}".encode()).hexdigest()[:12]
+            person = person_of(kid, drinker)
             liking.setdefault((person, sid), []).append(int(body["stars"]))
     for (person, sid), stars in liking.items():
         if person in people:
@@ -450,9 +502,21 @@ def _fit_component(insts, by_instance, group_of, maker):
         if all(abs(fineness[i] - before.get(i, 1e9)) < 1e-6 for i in fineness):
             break
     scale = {g: group_scale[group_of[g]] for g in offset}
-    groups = {grp: {"scale": group_scale[grp], "known": grp in maker, "instances": len(members[grp]),
-                    "axis": axis, "offset_spread": zero_spread([offset[g] for g in members[grp] if g in offset])}
-              for grp in members if grp in group_scale}
+    groups = {}
+    for grp in members:
+        if grp not in group_scale:
+            continue
+        latest = {}
+        for g in members[grp]:
+            if g in offset and (g[0] not in latest or g[1] > latest[g[0]][1]):
+                latest[g[0]] = g
+        zeros = [offset[g] for g in latest.values()]
+        groups[grp] = {"scale": group_scale[grp], "known": grp in maker, "instances": len(members[grp]),
+                       "axis": axis, "offset_spread": zero_spread(zeros),
+                       # where a grinder of this model typically sits: for a new owner who has no
+                       # coffee in common with anyone yet. Not from one grinder alone.
+                       "offset_zero": statistics.median(zeros) if len(zeros) >= 2 else None,
+                       "offset_n": len(zeros)}
     return fineness, scale, offset, axis, groups
 
 
@@ -703,8 +767,12 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
     os.makedirs(os.path.join(out, "fit"), exist_ok=True)
 
     def write(path, value):
+        text = json.dumps(value, separators=(",", ":"), sort_keys=True)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(value, f, separators=(",", ":"), sort_keys=True)
+            f.write(text)
+        # Controllers read an index file into 64 kB: warn well before one stops fitting.
+        if len(text.encode("utf-8")) > INDEX_WARN_BYTES:
+            log(f"warning: {os.path.relpath(path, root)} is {len(text)} bytes; controllers read at most 65535")
 
     # Published coffees.
     coffees = []
@@ -743,7 +811,14 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
             vr.check_reading(entry)
             if not library_file(entry.get("id")) or "/" in entry["id"]:
                 raise vr.Refused("id is not a plain lower-case name")
-            listed.append({k: entry[k] for k in ("id", "model", "burrs", "unit", "um_per_unit", "divisor", "sub_steps") if k in entry})
+            # The setting's range, in stored steps, where it is given.
+            if "min" in entry or "max" in entry:
+                vr._number(entry, "min", 1, 2000)
+                vr._number(entry, "max", 1, 2000)
+                if entry["min"] >= entry["max"]:
+                    raise vr.Refused("min is not below max")
+            listed.append({k: entry[k] for k in ("id", "model", "burrs", "unit", "um_per_unit", "divisor", "sub_steps",
+                                                 "min", "max") if k in entry})
         except (vr.Refused, ValueError, OSError, AttributeError, TypeError) as error:
             log(f"grinder entry ignored: {path}: {error}")
     write(os.path.join(out, "grinders.json"), {"v": 1, "grinders": listed})
@@ -841,6 +916,9 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
                      source="maker" if info["known"] else "fitted")
         if info.get("offset_spread") is not None:
             entry["zero_spread"] = round(info["offset_spread"], 2)
+        if info.get("offset_zero") is not None:
+            entry["zero"] = round(info["offset_zero"], 2)
+            entry["zero_n"] = info["offset_n"]
         if info["axis"]:
             entry["axis"] = info["axis"]
         else:
@@ -1234,6 +1312,38 @@ def self_test():
         assert "spread" not in df_m                      # two owners and no model-wide figure: none claimed
         sens = read_json(os.path.join(root, "index", "flow.json"))["sensitivity"]
         assert sens == [{"axis": 0, "kappa": 84.0, "n": 0, "source": "prior"}], sens
+    # 4. One model, one key: three Niche owners, one whose records name the grinder only by the
+    #    firmware's number (5), two by the library's entry for it, which lists that number. They
+    #    pool into one model, whose typical zero is published, and that zero with the model's scale
+    #    places a coffee for an owner who has none in common with anyone (a new owner).
+    niche_number = {"model_id": 5, "model": "Niche Zero", "unit": "dial"}
+    niche_entry = {"model_id": 5, "library_id": "niche-zero", "model": "Niche Zero", "unit": "dial"}
+    people = {"m1": (0x5201, niche_number, 0.2, 4.0, cs[:3]), "m2": (0x5202, niche_entry, 0.2, -6.0, cs[:3]),
+              "m3": (0x5203, niche_entry, 0.2, 11.0, cs[:3])}
+    with tempfile.TemporaryDirectory() as root:
+        truth = make_example(root, log=lambda *_: None, people=people)
+        os.makedirs(os.path.join(root, "grinders"), exist_ok=True)
+        with open(os.path.join(root, "grinders", "niche-zero.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "niche-zero", "model": "Niche Zero", "unit": "dial", "model_id": 5}, f)
+        build(root, log=lambda *_: None)
+        models = read_json(os.path.join(root, "index", "models.json"))["models"]
+        niche_models = [m for m in models if m.get("library_id") == "niche-zero" or m.get("model_id") == 5]
+        assert len(niche_models) == 1 and niche_models[0].get("library_id") == "niche-zero", models
+        nm = niche_models[0]
+        assert nm["owners"] == 3 and nm["zero_n"] == 3 and "zero" in nm, nm
+        # The median owner (offset 4) is where a new owner is placed: within a step of his setting.
+        first = read_json(os.path.join(root, "index", "dialin", "portrait__idjwi-island.json"))["recipes"][0]
+        m1 = kid_of(0x5201)
+        placed = nm["scale"] * first["fineness_um"] + nm["zero"]
+        assert abs(placed - truth[(m1, "portrait/idjwi-island")]) <= 1.5, (placed, truth)
+    # 5. A model fitted for one grinder only gives no zero: one grinder's zero is not the model's.
+    people = {"o1": (0x5301, niche_entry, 0.2, 4.0, cs[:3]),
+              "o2": (0x5302, {"model_id": 3, "model": "DF64", "unit": "dial"}, 0.25, 9.0, cs[:3])}
+    with tempfile.TemporaryDirectory() as root:
+        make_example(root, log=lambda *_: None, people=people)
+        build(root, log=lambda *_: None)
+        for m in read_json(os.path.join(root, "index", "models.json"))["models"]:
+            assert "zero" not in m, m
     print("self-test passed")
 
 

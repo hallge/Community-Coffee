@@ -1,0 +1,10 @@
+{
+ "id": "df64",
+ "model": "DF64",
+ "burrs": "64 mm flat",
+ "unit": "dial",
+ "model_id": 3,
+ "min": 1,
+ "max": 90,
+ "source": "Steps as marked on the grinder; microns per step not published: learned from owners' shots."
+}

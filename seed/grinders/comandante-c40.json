@@ -1,0 +1,11 @@
+{
+ "id": "comandante-c40",
+ "model": "Comandante C40",
+ "burrs": "39 mm conical",
+ "unit": "click",
+ "model_id": 18,
+ "um_per_unit": 30.0,
+ "min": 1,
+ "max": 40,
+ "source": "Comandante: about 30 microns per click (MK3/MK4)."
+}

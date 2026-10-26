@@ -1,0 +1,9 @@
+{
+ "id": "mahlkonig-e64-ws",
+ "model": "Mahlkonig E64 WS",
+ "burrs": "64 mm flat",
+ "unit": "um",
+ "model_id": 1,
+ "um_per_unit": 1.0,
+ "source": "The grinder's display reads the burr gap in microns."
+}
