@@ -58,16 +58,21 @@ def write_grinders(registry, out):
 
 
 def install(library):
-    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "seed", "grinders")
-    target = os.path.join(library, "grinders")
-    os.makedirs(target, exist_ok=True)
+    """Seeded grinders into grinders/ and seeded Community Hub links into links/, where no entry of that
+    id is there yet: an entry the community has changed is never overwritten."""
     added = []
-    for path in sorted(glob.glob(os.path.join(here, "*.json"))):
-        dest = os.path.join(target, os.path.basename(path))
-        if not os.path.exists(dest):
-            shutil.copyfile(path, dest)
-            added.append(os.path.basename(path))
-    print(f"{len(added)} added to {target}" + ("".join(f"\n  {a}" for a in added) if added else ""))
+    for kind in ("grinders", "links"):
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "seed", kind)
+        target = os.path.join(library, kind)
+        os.makedirs(target, exist_ok=True)
+        new = []
+        for path in sorted(glob.glob(os.path.join(here, "*.json"))):
+            dest = os.path.join(target, os.path.basename(path))
+            if not os.path.exists(dest):
+                shutil.copyfile(path, dest)
+                new.append(os.path.basename(path))
+        print(f"{len(new)} added to {target}" + ("".join(f"\n  {a}" for a in new) if new else ""))
+        added += new
     return added
 
 

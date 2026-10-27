@@ -333,6 +333,115 @@ def build_taste(root, min_contributors=2, log=print):
     return {"v": 1, "coffees": coffees, "people": people, "services": services}
 
 
+LINK_ID_OK = lambda s: (isinstance(s, str) and 0 < len(s) <= 39
+                        and all(c.islower() or c.isdigit() or c == "-" for c in s))
+
+
+def build_links(root, log=print):
+    """index/links.json: the Community Hub's links reviewers have listed, newest first."""
+    links = []
+    for path in sorted(glob.glob(os.path.join(root, "links", "*.json"))):
+        try:
+            entry = read_json(path)
+            vr.check_link(entry, full=False)
+            if not LINK_ID_OK(entry.get("id")) or entry["id"] != os.path.splitext(os.path.basename(path))[0]:
+                raise vr.Refused("id is not the file's plain lower-case name")
+            item = {k: entry[k] for k in ("id", "url", "title", "kind", "topics", "why", "image", "added") if k in entry}
+            item["site"] = entry["url"].split("/")[2].removeprefix("www.").removeprefix("m.")
+            links.append(item)
+        except (vr.Refused, ValueError, OSError, AttributeError, TypeError, KeyError) as error:
+            log(f"link entry ignored: {path}: {error}")
+    links.sort(key=lambda l: (l.get("added", ""), l["id"]), reverse=True)
+    return {"v": 1, "links": links}
+
+
+def recipe_method(recipe):
+    """How a recipe starts: a bloom (a pause after the first drops), a held pre-infusion, or straight."""
+    if recipe.get("bloom_pause_s"):
+        return "bloom"
+    if recipe.get("preinfusion_hold_s"):
+        return "preinfusion"
+    return "straight"
+
+
+def build_trending(root, min_contributors=2, days=90, now=None, log=print):
+    """index/trending.json: the recipes most people settled on lately (dial-ins of the last `days`), by
+    dose, yield and how the shot starts; each from at least `min_contributors` controllers."""
+    import datetime
+    keys = vr.load_keys(os.path.join(root, "keys"))
+    seen = []
+    for path in sorted(glob.glob(os.path.join(root, "dialins", "**", "*.json"), recursive=True)):
+        try:
+            with open(path, encoding="utf-8") as f:
+                kind, kid, body = vr.verify(f.read(), keys)
+            if kind != "dialin":
+                continue
+            at = datetime.datetime.strptime(body.get("at", "")[:10], "%Y-%m-%d")
+        except (vr.Refused, ValueError, KeyError, OSError):
+            continue
+        seen.append((at, kid, body))
+    if not seen:
+        return {"v": 1, "days": days, "recipes": []}
+    newest = now or max(a for a, _, _ in seen)
+    groups = {}
+    for at, kid, body in seen:
+        if (newest - at).days > days:
+            continue
+        r = body["recipe"]
+        key = (round(float(r["dose_g"]) * 2) / 2, int(round(float(r["yield_g"]))), recipe_method(r))
+        g = groups.setdefault(key, {"kids": set(), "times": [], "coffees": set(), "n": 0})
+        g["kids"].add(kid)
+        g["times"].append(float(body["result"]["time_s"]))
+        c = body.get("coffee") or {}
+        g["coffees"].add(c.get("library_id") or (str(c.get("roaster", "")).lower(), str(c.get("name", "")).lower()))
+        g["n"] += 1
+    recipes = []
+    for (dose, yield_g, method), g in groups.items():
+        if len(g["kids"]) < min_contributors:
+            continue
+        recipes.append({"dose_g": dose, "yield_g": yield_g, "ratio": round(yield_g / dose, 1), "method": method,
+                        "time_s": round(statistics.median(g["times"]), 1), "contributors": len(g["kids"]),
+                        "dialins": g["n"], "coffees": len(g["coffees"])})
+    recipes.sort(key=lambda r: (-r["contributors"], -r["dialins"], r["dose_g"], r["yield_g"]))
+    return {"v": 1, "days": days, "recipes": recipes[:10]}
+
+
+DIRECTORY_PAGE = 100   # coffees per page of the directory: well inside the controller's buffer
+
+
+def build_directory(coffees, taste):
+    """index/directory/: the published coffees in pages a controller keeps on flash and searches itself.
+    manifest.json lists the pages with a hash each (only changed pages are fetched again) and the values
+    to filter by."""
+    rated = (taste or {}).get("coffees", {})
+    rows = []
+    for c in sorted(coffees, key=lambda c: (str(c.get("roaster", "")).lower(), str(c.get("name", "")).lower())):
+        row = {k: c[k] for k in ("id", "name", "roaster", "origin", "region", "process", "varietal", "roast_level")
+               if c.get(k)}
+        if c.get("notes"):
+            row["notes"] = str(c["notes"])[:80]
+        t = rated.get(c["id"])
+        if isinstance(t, dict) and t.get("stars"):
+            row["stars"] = t["stars"]
+            row["n"] = t.get("n", 0)
+        rows.append(row)
+    pages, listed = [], []
+    for start in range(0, len(rows), DIRECTORY_PAGE):
+        page = {"v": 1, "coffees": rows[start:start + DIRECTORY_PAGE]}
+        text = json.dumps(page, separators=(",", ":"), sort_keys=True)
+        pages.append(page)
+        listed.append({"n": len(listed), "count": len(page["coffees"]),
+                       "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]})
+    facets = {}
+    for field in ("origin", "process", "roast_level", "roaster"):
+        counts = {}
+        for r in rows:
+            if r.get(field):
+                counts[r[field]] = counts.get(r[field], 0) + 1
+        facets[field] = dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:30])
+    return {"v": 1, "count": len(rows), "page_size": DIRECTORY_PAGE, "pages": listed, "facets": facets}, pages
+
+
 def build_services(root, min_contributors=2, log=print):
     """index/services.json: the subscription services reviewers have listed, each with what people who
     use it think of it, once at least `min_contributors` controllers have reviewed it."""
@@ -788,7 +897,21 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
     write(os.path.join(out, "coffees.json"), {"v": 1, "coffees": coffees})
 
     # Coffee ratings.
-    write(os.path.join(out, "taste.json"), build_taste(root, min_contributors, log))
+    taste = build_taste(root, min_contributors, log)
+    write(os.path.join(out, "taste.json"), taste)
+
+    # The coffee directory: the same coffees, in pages a controller keeps and searches itself.
+    manifest, pages = build_directory(coffees, taste)
+    os.makedirs(os.path.join(out, "directory"), exist_ok=True)
+    for old in glob.glob(os.path.join(out, "directory", "p*.json")):
+        os.remove(old)
+    for n, page in enumerate(pages):
+        write(os.path.join(out, "directory", f"p{n:03d}.json"), page)
+    write(os.path.join(out, "directory", "manifest.json"), manifest)
+
+    # The Community Hub: links reviewers have listed, and the recipes people settled on lately.
+    write(os.path.join(out, "links.json"), build_links(root, log))
+    write(os.path.join(out, "trending.json"), build_trending(root, min_contributors, log=log))
 
     # Subscription services reviewers have listed, and what their users think of them.
     write(os.path.join(out, "services.json"), build_services(root, min_contributors, log))
@@ -1186,6 +1309,32 @@ def self_test():
         build(root, log=lambda *_: None)
         index = read_json(os.path.join(root, "index", "coffees.json"))
         assert len(index["coffees"]) == 4
+        # The directory: the same coffees, one page, its hash and the values to filter by.
+        manifest = read_json(os.path.join(root, "index", "directory", "manifest.json"))
+        assert manifest["count"] == 4 and len(manifest["pages"]) == 1 and len(manifest["pages"][0]["hash"]) == 12
+        page = read_json(os.path.join(root, "index", "directory", "p000.json"))
+        assert len(page["coffees"]) == 4 and all("id" in c and "name" in c for c in page["coffees"])
+        assert sum(manifest["facets"]["roaster"].values()) == 4
+        many = [{"id": f"r/c{i}", "name": f"C{i}", "roaster": "R", "origin": "Kenya" if i % 2 else "Peru"}
+                for i in range(250)]
+        m2, p2 = build_directory(many, {})
+        assert m2["count"] == 250 and [x["count"] for x in m2["pages"]] == [100, 100, 50]
+        assert m2["facets"]["origin"] == {"Kenya": 125, "Peru": 125}
+        assert all(len(json.dumps(x, separators=(",", ":"))) < 16384 for x in p2)
+        # Trending: the example's owners all settled on the same recipe.
+        trending = read_json(os.path.join(root, "index", "trending.json"))
+        assert trending["recipes"] and trending["recipes"][0]["contributors"] >= 2
+        assert trending["recipes"][0]["method"] in ("straight", "preinfusion", "bloom")
+        # Links: a listed one is published, a bad one is not.
+        os.makedirs(os.path.join(root, "links"), exist_ok=True)
+        with open(os.path.join(root, "links", "understanding-espresso.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "understanding-espresso", "url": "https://www.youtube.com/playlist?list=PLx",
+                       "title": "Understanding Espresso", "kind": "playlist", "topics": ["dialing_in"],
+                       "added": "2026-10-26"}, f)
+        with open(os.path.join(root, "links", "bad.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "bad", "url": "http://x.example/", "title": "x", "kind": "video", "topics": ["gear"]}, f)
+        links = build_links(root, log=lambda *_: None)["links"]
+        assert [l["id"] for l in links] == ["understanding-espresso"] and links[0]["site"] == "youtube.com"
         # Coffee ratings: a coffee rated by two contributors is published, one rated by one is not;
         # a drinker with three of the published coffees rated is listed, anonymously.
         def kid_of(private):

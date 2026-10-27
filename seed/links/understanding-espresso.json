@@ -1,0 +1,12 @@
+{
+ "id": "understanding-espresso",
+ "url": "https://www.youtube.com/playlist?list=PLxz0FjZMVOl3MuAzK5l3gjakoOGrmK8fP",
+ "title": "Understanding Espresso (James Hoffmann)",
+ "kind": "playlist",
+ "topics": [
+  "dialing_in",
+  "brewing"
+ ],
+ "why": "Six short episodes, one variable each: dose, ratio, time, grind, temperature, pressure.",
+ "added": "2026-10-26"
+}

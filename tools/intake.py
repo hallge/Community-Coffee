@@ -25,6 +25,7 @@ What happens to a record that passes depends on what it is:
   taste    a coffee rating, filed under tastes/ (a changed rating replaces the earlier one).
   service_review  a rating of a listed subscription service, filed under svcreviews/ (the same).
   grinder, machine, service  descriptions for the shared lists: reviewed, like a coffee.
+  link     a video, post or guide for the Community Hub: reviewed, like a coffee.
   coffee   NOT published. It is parked under pending/, the contributor's
            status file says "review", and the plan lists a pull request to
            open that would add it to catalog/. A person decides.
@@ -54,6 +55,7 @@ MACHINE_FIELDS = ("maker", "model", "control", "style", "manual_start", "hold_pr
                   "tap_preinfusion", "power_toggle", "self_stop_s")
 SERVICE_FIELDS = ("name", "url", "manage_url", "platform", "kind", "ships_to", "cadences", "price_from_cents",
                   "currency", "style", "sourcing", "image", "icon", "color", "about")
+LINK_FIELDS = ("url", "title", "kind", "topics", "why", "image")
 NOTE_LIMIT = 47     # what the controller keeps of a reviewer's note
 MAX_RECORD_BYTES = 8192
 
@@ -116,7 +118,8 @@ def set_status(library, kid, local_id, record, state, library_id="", note="", se
     return True
 
 
-STATUS_SECTIONS = {"coffee": "coffees", "grinder": "grinders", "machine": "machines", "service": "services"}
+STATUS_SECTIONS = {"coffee": "coffees", "grinder": "grinders", "machine": "machines", "service": "services",
+                   "link": "links"}
 
 
 def tell_refused(library, error):
@@ -249,6 +252,36 @@ def service_request_text(library, kid, body, proposed_id, exists):
     ])
 
 
+def link_request_text(library, kid, body, proposed_id, exists):
+    rows = "\n".join(f"| {field} | {', '.join(body[field]) if isinstance(body[field], list) else body[field]} |"
+                     for field in LINK_FIELDS if field in body and field != "image")
+    same = []
+    for path in glob.glob(os.path.join(library, "links", "*.json")):
+        entry = read_json(path, {}) or {}
+        if isinstance(entry, dict) and entry.get("url") == body["url"]:
+            same.append(os.path.splitext(os.path.basename(path))[0])
+    meta = json.dumps({"kind": "link", "kid": kid, "local_id": body["local_id"], "record": body["record"],
+                       "library_id": proposed_id}, separators=(",", ":"))
+    return "\n".join([
+        f"A controller's owner suggests this link for the Community Hub{' again, changed' if exists else ''}. Its "
+        "record passed the signature and value checks; whether it is worth showing everyone is for a person to "
+        "decide.",
+        "", "| | |", "| --- | --- |", rows, "",
+        f"**Would be listed as** `{proposed_id}`" + (" (this entry exists: merging replaces it)" if exists else ""),
+        "",
+        "**Check:** the link opens what the title says; it is about espresso; it is not an advert or a "
+        "shop's product page; the topics fit.",
+        "",
+        "**Already listed with the same link:** " + (", ".join(f"`{s}`" for s in sorted(same)) or "none."),
+        "",
+        "- **Merge** to show it on every controller's Community page. Edit the file in this pull request "
+        "first if anything needs correcting.",
+        f"- **Close** to decline. A last comment starting `Declined:` is shown to the owner (first {NOTE_LIMIT} characters).",
+        "",
+        f"<!-- intake {meta} -->",
+    ])
+
+
 def grinder_request_text(library, kid, body, proposed_id, exists):
     rows = "\n".join(f"| {field.replace('_', ' ')} | {body[field]} |" for field in GRINDER_FIELDS if field in body)
     existing = sorted(os.path.splitext(os.path.basename(p))[0]
@@ -349,6 +382,29 @@ def take(inbox, library, log=print):
                 "branch": f"review/{kid}-s{local_id}-{record}",
                 "title": f"{'Change' if exists else 'Add'} subscription service: {body['name']}",
                 "body": service_request_text(library, kid, body, proposed, exists),
+                "catalog_path": listed_path,
+                "catalog_text": json.dumps(entry, indent=1) + "\n",
+                "pending_path": pending,
+            })
+            report.append((shown, "for review", listed_path))
+        elif kind == "link":   # a link for the Community Hub: reviewed, like a coffee
+            local_id, record = body["local_id"], body["record"]
+            pending = f"pending/links/{kid}/l{local_id}-{record}.json"
+            if not set_status(library, kid, local_id, record, "review", section="links"):
+                report.append((shown, "refused", "an earlier version of a link that has been sent again since"))
+                continue
+            write_text(os.path.join(library, pending), text)
+            proposed = (slug(body["title"])[:39].strip("-")) or "link"
+            listed_path = f"links/{proposed}.json"
+            exists = os.path.exists(os.path.join(library, listed_path))
+            entry = {"id": proposed}
+            entry.update({field: body[field] for field in LINK_FIELDS if field in body})
+            if re.match(r"^\d{4}-\d{2}-\d{2}", body.get("at", "")):
+                entry["added"] = body["at"][:10]
+            plan.append({
+                "branch": f"review/{kid}-l{local_id}-{record}",
+                "title": f"{'Change' if exists else 'Add'} link: {body['title']}",
+                "body": link_request_text(library, kid, body, proposed, exists),
                 "catalog_path": listed_path,
                 "catalog_text": json.dumps(entry, indent=1) + "\n",
                 "pending_path": pending,
@@ -591,6 +647,25 @@ def self_test():
         assert "local_id" not in json.loads(splan["catalog_text"])
         status = read_json(os.path.join(library, "status", anna[1] + ".json"))
         assert {e["local_id"]: e["state"] for e in status["services"]} == {3: "review", 4: "refused"}
+    # A link for the Community Hub goes to review, with its date; a later version replaces the earlier.
+    link = {"t": "link", "v": 1, "record": 50, "local_id": 2, "at": "2026-10-26T10:00:00Z",
+            "url": "https://www.youtube.com/playlist?list=PLxz0FjZMVOl3MuAzK5l3gjakoOGrmK8fP",
+            "title": "Understanding Espresso", "kind": "playlist", "topics": ["dialing_in", "brewing"],
+            "why": "Six short episodes, one variable each"}
+    with tempfile.TemporaryDirectory() as root:
+        inbox, library = os.path.join(root, "inbox"), os.path.join(root, "library")
+        os.makedirs(library)
+        write_text(os.path.join(inbox, "k.json"), bi._envelope(anna[0], anna[1], {"t": "key", "v": 1, "alg": "ES256", "key": anna[2]}))
+        write_text(os.path.join(inbox, "l.json"), bi._envelope(anna[0], anna[1], link))
+        plan, report = take(inbox, library, log=lambda *_: None)
+        outcome = {name: (what, detail) for name, what, detail in report}
+        assert outcome["l.json"] == ("for review", "links/understanding-espresso.json")
+        lplan = [p for p in plan if p["branch"] == f"review/{anna[1]}-l2-50"][0]
+        entry = json.loads(lplan["catalog_text"])
+        assert lplan["title"] == "Add link: Understanding Espresso" and entry["added"] == "2026-10-26"
+        assert entry["topics"] == ["dialing_in", "brewing"] and "local_id" not in entry
+        status = read_json(os.path.join(library, "status", anna[1] + ".json"))
+        assert status["links"] == [{"local_id": 2, "record": 50, "state": "review"}]
     print("self-test passed")
 
 

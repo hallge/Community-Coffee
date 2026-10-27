@@ -81,7 +81,10 @@ def ecdsa_verify(public, digest, r, s):
 
 
 # ---- records ----------------------------------------------------------------
-TYPES = ("key", "coffee", "grinder", "machine", "dialin", "shot", "taste", "service", "service_review")
+TYPES = ("key", "coffee", "grinder", "machine", "dialin", "shot", "taste", "service", "service_review", "link")
+# A link suggested for the Community Hub (docs/COMMUNITY.md): what it is, and what it is about.
+LINK_KINDS = ("video", "playlist", "post", "guide", "article", "podcast")
+LINK_TOPICS = ("preparation", "dialing_in", "brewing", "beans", "gear", "milk", "maintenance", "science")
 # A coffee rating (docs/COFFEE-TASTE.md in the firmware repository): the cup and the flavour families.
 CUP = ("acidity", "sweetness", "body", "bitterness", "finish")
 FLAVOURS = ("fruity", "floral", "sweet", "chocolate", "spicy", "roasty", "fermented", "earthy")
@@ -201,7 +204,7 @@ def _link(obj, name, required=True):
             or any(ord(c) <= 0x20 or ord(c) > 0x7E for c in value)):
         raise Refused(f"{name} is not an https link of at most {limit} characters")
     # Nothing of one customer's: a shop's general page, not someone's portal, login token or tracking.
-    if name in ("image", "icon"):
+    if name in ("image", "icon") or obj.get("t") == "link":  # pictures and Hub links (a video's ?v=) keep a query
         query = value.partition("?")[2].lower()
         if any(word in query for word in ("token", "key=", "sig", "auth", "session", "password")):
             raise Refused(f"{name} carries what looks like a credential")
@@ -260,6 +263,22 @@ def check_service(s, full=True):
     if full:
         _number(s, "local_id", 1, 65535)
         _number(s, "record", 0, 4294967295)
+
+
+def check_link(l, full=True):
+    """A link for the Community Hub. full: as a controller sends it; else as the library lists it."""
+    _link(dict(l, t="link"), "url")
+    _text(l, "title", 79)
+    if l.get("kind") not in LINK_KINDS:
+        raise Refused("kind is not one the controller offers")
+    if "topics" not in l:
+        raise Refused("topics is missing")
+    _choices(l, "topics", LINK_TOPICS, 3)
+    _text(l, "why", 160, required=False)
+    _link(l, "image", required=False)
+    if full:
+        _number(l, "local_id", 1, 65535)
+        _number(l, "record", 0, 4294967295)
 
 
 def _service_id(obj, name):
@@ -326,6 +345,9 @@ def check_body(body):
     elif kind == "service":
         # A subscription service set up by its owner, for a reviewer. Never the owner's own price or dates.
         check_service(body)
+    elif kind == "link":
+        # A video, post or guide an owner suggests for the Community Hub, for a reviewer.
+        check_link(body)
     elif kind == "service_review":
         # How a drinker rated a listed service: stars and aspects. The drinker is a number, never a name.
         _number(body, "id", 1, 4294967295)
@@ -518,6 +540,14 @@ def self_test():
     assert verify(envelope(grinder), keys)[0] == "grinder"
     assert "unit is missing" in refused(envelope(grinder.replace(',"unit":"dial"', "")))
     assert "unknown record type" in refused(envelope('{"t":"other","v":1}'))
+    # A link for the Community Hub.
+    link = ('{"t":"link","v":1,"record":5,"local_id":2,"url":"https://www.youtube.com/watch?v=aTFsBqhpLes",'
+            '"title":"Understanding Espresso - Dose","kind":"video","topics":["dialing_in"],"why":"Dose, explained"}')
+    assert verify(envelope(link), keys)[0] == "link"
+    assert "https" in refused(envelope(link.replace("https://www.youtube", "http://www.youtube")))
+    assert "topics" in refused(envelope(link.replace('["dialing_in"]', '["cats"]')))
+    assert "topics is missing" in refused(envelope(link.replace(',"topics":["dialing_in"]', '')))
+    assert "kind" in refused(envelope(link.replace('"video"', '"meme"')))
     # A deleted rating, withdrawn: its id and nothing about the coffee or the drinker.
     withdrawn = '{"t":"taste","v":1,"id":42,"at":"2026-10-26T10:00:00Z","withdrawn":true}'
     assert verify(envelope(withdrawn), keys)[0] == "taste"

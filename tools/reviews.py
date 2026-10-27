@@ -79,8 +79,9 @@ def decision(body, merged, comments, files, read_catalog):
         return None
     if not re.fullmatch(r"[0-9a-f]{20}", str(kid)):
         return None
-    kind = meta.get("kind") if meta.get("kind") in ("grinder", "machine", "service") else "coffee"
-    folder = {"grinder": "grinders/", "machine": "machines/", "service": "services/"}.get(kind, "catalog/")
+    kind = meta.get("kind") if meta.get("kind") in ("grinder", "machine", "service", "link") else "coffee"
+    folder = {"grinder": "grinders/", "machine": "machines/", "service": "services/",
+              "link": "links/"}.get(kind, "catalog/")
     result = {"kind": kind, "kid": kid, "local_id": local_id, "record": record}
     if merged:
         # The reviewer may have renamed the entry: go by what was merged.
@@ -115,7 +116,7 @@ def close_review():
         print("not a review pull request, or nothing was published: status left alone")
         return
     section, letter = {"grinder": ("grinders", "g"), "machine": ("machines", "m"),
-                       "service": ("services", "s")}.get(result["kind"], ("coffees", "c"))
+                       "service": ("services", "s"), "link": ("links", "l")}.get(result["kind"], ("coffees", "c"))
     changed = intake.set_status(".", result["kid"], result["local_id"], result["record"],
                                 result["state"], result["library_id"], result["note"], section)
     pending = f"pending/{section}/{result['kid']}/{letter}{result['local_id']}-{result['record']}.json"
