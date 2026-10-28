@@ -1,1 +1,0 @@
-{"v":1,"kid":"ab3fa6ca830b137b00fb","alg":"ES256","sig":"jRzKbyh5rG4YlpxhmIqcWvP6qAEgc1tQaRnVzSXfyv8KZHo6mBig6IQrNZSoICGFH+5iBQoGEWkc8EvNSIncbA==","body":"{\"t\":\"coffee\",\"v\":1,\"at\":\"2026-10-24T04:00:04Z\",\"record\":17,\"local_id\":10,\"name\":\"Relay Test Coffee\",\"roaster\":\"Relay Test Roaster\",\"origin\":\"Testland\",\"notes\":\"relay check, please decline\"}"}
