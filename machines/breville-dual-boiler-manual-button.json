@@ -1,0 +1,11 @@
+{
+ "id": "breville-dual-boiler-manual-button",
+ "maker": "Breville",
+ "model": "Dual Boiler",
+ "control": "MANUAL button",
+ "style": "toggle_button",
+ "hold_preinfusion": 1,
+ "tap_preinfusion": 1,
+ "power_toggle": 1,
+ "self_stop_s": 90
+}
