@@ -1,1 +1,1 @@
-{"count":1,"facets":{"origin":{"Honduras":1},"process":{"Natural":1},"roast_level":{"medium-light":1},"roaster":{"Portrait":1}},"page_size":100,"pages":[{"count":1,"hash":"1055781b5e92","n":0}],"v":1}
+{"count":2,"facets":{"origin":{"Honduras":1,"Rwanda":1},"process":{"Natural":1,"Washed":1},"roast_level":{"medium-light":2},"roaster":{"Portrait":2}},"page_size":100,"pages":[{"count":2,"hash":"ce5ad14e24d0","n":0}],"v":1}
