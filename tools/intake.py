@@ -50,7 +50,7 @@ import verify_record as vr  # noqa: E402
 
 CATALOG_FIELDS = ("name", "roaster", "origin", "region", "producer", "varietal", "process",
                   "roast_level", "altitude_m", "notes")
-GRINDER_FIELDS = ("model", "burrs", "unit", "um_per_unit", "divisor", "sub_steps")
+GRINDER_FIELDS = ("model", "burrs", "unit", "um_per_unit", "divisor", "sub_steps", "min", "max")
 MACHINE_FIELDS = ("maker", "model", "control", "style", "manual_start", "hold_preinfusion",
                   "tap_preinfusion", "power_toggle", "self_stop_s")
 SERVICE_FIELDS = ("name", "url", "manage_url", "platform", "kind", "ships_to", "cadences", "price_from_cents",

@@ -181,6 +181,15 @@ def check_reading(g):
         raise Refused("a ringed dial has no divisor")
 
 
+def check_range(g):
+    """A grinder's range in stored steps: both ends or neither, finest below coarsest."""
+    if "min" in g or "max" in g:
+        _number(g, "min", 1, 2000)
+        _number(g, "max", 1, 2000)
+        if g["min"] >= g["max"]:
+            raise Refused("grinder.min is not below grinder.max")
+
+
 def check_grinder(g):
     check_reading(g)
     _text(g, "unit", 7)
@@ -323,6 +332,7 @@ def check_body(body):
         _text(body, "burrs", 23, required=False)
         _text(body, "unit", 7)
         check_reading(body)
+        check_range(body)
         _number(body, "um_per_unit", 0.01, 1000, required=False)
         _number(body, "local_id", 1, 65535)
         _number(body, "record", 0, 4294967295)
@@ -539,6 +549,10 @@ def self_test():
     grinder = '{"t":"grinder","v":1,"record":3,"local_id":2,"model":"Home Built 64","unit":"dial"}'
     assert verify(envelope(grinder), keys)[0] == "grinder"
     assert "unit is missing" in refused(envelope(grinder.replace(',"unit":"dial"', "")))
+    # Its range: both ends, finest below coarsest.
+    assert verify(envelope(grinder.replace('"unit":"dial"', '"unit":"dial","min":1,"max":60')), keys)[0] == "grinder"
+    assert "max is missing" in refused(envelope(grinder.replace('"unit":"dial"', '"unit":"dial","min":1')))
+    assert "not below" in refused(envelope(grinder.replace('"unit":"dial"', '"unit":"dial","min":60,"max":60')))
     assert "unknown record type" in refused(envelope('{"t":"other","v":1}'))
     # A link for the Community Hub.
     link = ('{"t":"link","v":1,"record":5,"local_id":2,"url":"https://www.youtube.com/watch?v=aTFsBqhpLes",'
