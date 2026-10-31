@@ -58,6 +58,21 @@ per unit) only if the maker publishes it; left out, the index works the
 scale out from shared shots. Merge to list it, close to decline, as for a
 coffee.
 
+## Recipes, and owners reviewing
+
+A recipe an owner shares ("Add recipe: name") waits for review like a coffee,
+under `pending/recipes/`; merged, it is `recipes/<name>.json` and listed in
+`index/recipes.json`, the recipe book.
+
+Owners review coffees and recipes too, from their controllers: each sees what
+is waiting (`index/pending.json`) and may approve or decline it. A review is a
+signed `review` record. Intake takes it only from a controller that has had
+something published, never for its own item, and keeps one per reviewer in
+`pending/reviews/`. Each review is a comment on the item's pull request. Two
+approvals and no decline merge it, as a merge by hand would; a decline labels
+it `owner-declined` and leaves it for you. You can still merge or close any
+item yourself.
+
 ## Folders
 
 | Folder | What | Written by |

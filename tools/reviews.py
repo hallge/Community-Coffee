@@ -32,13 +32,16 @@ def run(*command, check=True, capture=False):
 
 # A review branch Intake names: review/<key id>-<c|g|m|s><local id>-<record> (coffee, grinder, machine,
 # subscription service).
-REVIEW_BRANCH = r"review/[0-9a-f]{20}-[cgms]\d+-\d+"
+REVIEW_BRANCH = r"review/[0-9a-f]{20}-[cgmsr]\d+-\d+"
 
 
 def open_reviews(plan_path):
     plan = intake.read_json(plan_path, []) or []
     opened = 0
     for item in plan:
+        if item.get("op") == "owner_review":
+            owner_review(item)
+            continue
         branch = item["branch"]
         if not re.fullmatch(REVIEW_BRANCH, branch):
             print(f"skipped: not a review branch name: {branch!r}")
@@ -62,6 +65,54 @@ def open_reviews(plan_path):
     print(f"{opened} pull request(s) opened")
 
 
+def owner_review_comment(item):
+    """The comment an owner review leaves on the item's pull request. Never a key in full: its start."""
+    who = f"an owner (key `{item['reviewer'][:6]}…`)"
+    if item["verdict"] == "approve":
+        text = f"Approved by {who}: {item['approvals']} of {intake.OWNER_APPROVALS} approvals."
+    else:
+        text = f"Declined by {who}: {item['note'] or 'no reason given'}. Held for a person to decide."
+    if item.get("publish"):
+        text += " Enough approvals and no decline: merging to publish."
+    return text
+
+
+def owner_review(item):
+    """An owner review from intake's plan: a comment on the item's pull request; a decline labels it and
+    leaves it open; enough approvals merge it and write the published status, as close does (a merge
+    made with the workflow's token starts no workflow, so review-outcome would not run)."""
+    branch = item["branch"]
+    if not re.fullmatch(REVIEW_BRANCH, branch):
+        print(f"skipped: not a review branch name: {branch!r}")
+        return
+    if run("gh", "pr", "view", branch, "--json", "number", check=False, capture=True) == "":
+        print(f"no pull request for {branch}: review kept for when it opens")
+        return
+    body_file = os.path.join(os.environ.get("RUNNER_TEMP", "."), "owner-review.md")
+    intake.write_text(body_file, owner_review_comment(item))
+    run("gh", "pr", "comment", branch, "--body-file", body_file)
+    if item["verdict"] == "decline":
+        run("gh", "label", "create", "owner-declined", "--color", "B60205", "--force", check=False)
+        run("gh", "pr", "edit", branch, "--add-label", "owner-declined", check=False)
+        return
+    if not item.get("publish"):
+        return
+    view = json.loads(run("gh", "pr", "view", branch, "--json", "number,body,labels", capture=True))
+    if any(l.get("name") == "owner-declined" for l in view.get("labels", [])):
+        print(f"{branch}: declined before, left for a person")
+        return
+    run("gh", "pr", "merge", branch, "--merge", "--delete-branch")
+    run("git", "fetch", "--quiet", "origin", "main")
+    run("git", "switch", "--quiet", "--detach", "origin/main")
+    close_review(str(view["number"]), True, view.get("body", ""))
+    if os.path.exists(intake.reviews_path(item["target"])):
+        os.remove(intake.reviews_path(item["target"]))
+    run("git", "add", "-A", "--", "status", "pending")
+    if run("git", "diff", "--cached", "--quiet", check=False) != 0:
+        run("git", "commit", "--quiet", "-m", f"Published by owner review: {item['target']}")
+        run("git", "push", "--quiet", "origin", "HEAD:main")
+
+
 def decision(body, merged, comments, files, read_catalog):
     """What to write in the status file, from a closed review pull request.
 
@@ -79,9 +130,9 @@ def decision(body, merged, comments, files, read_catalog):
         return None
     if not re.fullmatch(r"[0-9a-f]{20}", str(kid)):
         return None
-    kind = meta.get("kind") if meta.get("kind") in ("grinder", "machine", "service", "link") else "coffee"
+    kind = meta.get("kind") if meta.get("kind") in ("grinder", "machine", "service", "link", "recipe") else "coffee"
     folder = {"grinder": "grinders/", "machine": "machines/", "service": "services/",
-              "link": "links/"}.get(kind, "catalog/")
+              "link": "links/", "recipe": "recipes/"}.get(kind, "catalog/")
     result = {"kind": kind, "kid": kid, "local_id": local_id, "record": record}
     if merged:
         # The reviewer may have renamed the entry: go by what was merged.
@@ -105,18 +156,21 @@ def decision(body, merged, comments, files, read_catalog):
     return result
 
 
-def close_review():
-    number = os.environ["PR_NUMBER"]
-    merged = os.environ.get("PR_MERGED", "").lower() == "true"
+def close_review(number=None, merged=None, body=None):
+    number = number or os.environ["PR_NUMBER"]
+    if merged is None:
+        merged = os.environ.get("PR_MERGED", "").lower() == "true"
+    if body is None:
+        body = os.environ.get("PR_BODY", "")
     view = json.loads(run("gh", "pr", "view", number, "--json", "comments,files", capture=True))
     comments = [c.get("body", "") for c in view.get("comments", [])]
     files = [f.get("path", "") for f in view.get("files", [])]
-    result = decision(os.environ.get("PR_BODY", ""), merged, comments, files, intake.read_json)
+    result = decision(body, merged, comments, files, intake.read_json)
     if result is None:
         print("not a review pull request, or nothing was published: status left alone")
         return
-    section, letter = {"grinder": ("grinders", "g"), "machine": ("machines", "m"),
-                       "service": ("services", "s"), "link": ("links", "l")}.get(result["kind"], ("coffees", "c"))
+    section, letter = {"grinder": ("grinders", "g"), "machine": ("machines", "m"), "service": ("services", "s"),
+                       "link": ("links", "l"), "recipe": ("recipes", "r")}.get(result["kind"], ("coffees", "c"))
     changed = intake.set_status(".", result["kid"], result["local_id"], result["record"],
                                 result["state"], result["library_id"], result["note"], section)
     pending = f"pending/{section}/{result['kid']}/{letter}{result['local_id']}-{result['record']}.json"
@@ -143,7 +197,16 @@ def self_test():
     g = decision(gbody, True, [], ["grinders/home-built-64.json"], listed.get)
     assert g["kind"] == "grinder" and g["library_id"] == "home-built-64" and g["state"] == "published"
     # A machine profile is reviewed the same way.
-    assert all(re.fullmatch(REVIEW_BRANCH, f"review/0123456789abcdef0123-{k}1-12") for k in "cgm")
+    assert all(re.fullmatch(REVIEW_BRANCH, f"review/0123456789abcdef0123-{k}1-12") for k in "cgmr")
+    # A recipe merged: published under the recipe book's file.
+    rbody = 'x\n<!-- intake {"kind":"recipe","kid":"0123456789abcdef0123","local_id":3,"record":30,"library_id":"turbo-shot"} -->'
+    rmerged = decision(rbody, True, [], ["recipes/turbo-shot.json"], {"recipes/turbo-shot.json": {"id": "turbo-shot"}}.get)
+    assert rmerged["kind"] == "recipe" and rmerged["state"] == "published" and rmerged["library_id"] == "turbo-shot"
+    # What an owner review says on the pull request: never the key in full.
+    item = {"verdict": "approve", "reviewer": "0123456789abcdef0123", "approvals": 2, "publish": True, "note": ""}
+    text = owner_review_comment(item)
+    assert "2 of 2" in text and "merging" in text and "0123456789abcdef0123" not in text
+    assert "Held" in owner_review_comment(dict(item, verdict="decline", note="No", publish=False))
     assert not re.fullmatch(REVIEW_BRANCH, "review/0123456789abcdef0123-x1-12")
     mbody = '<!-- intake {"kind":"machine","kid":"0123456789abcdef0123","local_id":1,"record":12} -->'
     mlisted = {"machines/breville-dual-boiler-2-cup-button.json": {"id": "breville-dual-boiler-2-cup-button"}}

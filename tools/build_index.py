@@ -355,6 +355,61 @@ def build_links(root, log=print):
     return {"v": 1, "links": links}
 
 
+def build_recipe_book(root, log=print):
+    """index/recipes.json: the recipe book, recipes reviewers or owners published, by name."""
+    items = []
+    for path in sorted(glob.glob(os.path.join(root, "recipes", "*.json"))):
+        try:
+            entry = read_json(path)
+            recipe = entry.get("recipe")
+            if not isinstance(recipe, dict):
+                raise vr.Refused("recipe is missing")
+            vr._text(recipe, "name", 23)
+            vr.check_recipe(recipe)
+            if not LINK_ID_OK(entry.get("id")) or entry["id"] != os.path.splitext(os.path.basename(path))[0]:
+                raise vr.Refused("id is not the file's plain lower-case name")
+            keep = {k: recipe[k] for k in ("name", "dose_g", "yield_g", "target_time_s", "preinfusion_hold_s",
+                                           "bloom_pause_s", "note") if k in recipe}
+            items.append({"id": entry["id"], "recipe": keep, "contributors": int(entry.get("contributors", 1) or 1)})
+        except (vr.Refused, ValueError, OSError, AttributeError, TypeError, KeyError) as error:
+            log(f"recipe entry ignored: {path}: {error}")
+    items.sort(key=lambda i: i["recipe"]["name"].lower())
+    return {"v": 1, "items": items[:60]}
+
+
+def build_pending(root, log=print):
+    """index/pending.json: coffees and recipes waiting for review, newest first, with the owner reviews so
+    far, so that controllers can show them to owners who may review."""
+    items = []
+    for kind, letter in (("coffees", "c"), ("recipes", "r")):
+        for path in glob.glob(os.path.join(root, "pending", kind, "*", f"{letter}*.json")):
+            try:
+                body = json.loads(read_json(path)["body"])
+                kid = os.path.basename(os.path.dirname(path))
+                vr.check_body(body)
+                target = f"{kind}/{kid}/{os.path.splitext(os.path.basename(path))[0]}"
+                if not vr.REVIEW_TARGET.fullmatch(target):
+                    raise vr.Refused("not a pending item's name")
+                item = {"id": target, "type": kind[:-1], "from": kid, "at": body.get("at", "")}
+                if kind == "coffees":
+                    item["coffee"] = {k: body[k] for k in ("name", "roaster", "origin", "region", "producer", "varietal",
+                                                           "process", "roast_level", "altitude_m", "notes") if k in body}
+                else:
+                    item["recipe"] = body["recipe"]
+                rpath = os.path.join(root, "pending", "reviews", target.replace("/", "_") + ".json")
+                reviews = read_json(rpath) if os.path.exists(rpath) else {}
+                reviews = reviews.get("reviews", {}) if isinstance(reviews, dict) else {}
+                reviews = reviews if isinstance(reviews, dict) else {}
+                item["approvals"] = sum(1 for r in reviews.values() if isinstance(r, dict) and r.get("verdict") == "approve")
+                item["declines"] = sum(1 for r in reviews.values() if isinstance(r, dict) and r.get("verdict") == "decline")
+                item["notes"] = [r["note"] for r in reviews.values() if isinstance(r, dict) and r.get("note")][:5]
+                items.append(item)
+            except (vr.Refused, ValueError, OSError, AttributeError, TypeError, KeyError) as error:
+                log(f"pending entry ignored: {path}: {error}")
+    items.sort(key=lambda i: (i["at"], i["id"]), reverse=True)
+    return {"v": 1, "items": items[:40]}
+
+
 def recipe_method(recipe):
     """How a recipe starts: a bloom (a pause after the first drops), a held pre-infusion, or straight."""
     if recipe.get("bloom_pause_s"):
@@ -912,6 +967,10 @@ def build(root, accept_unsigned=False, min_contributors=2, log=print):
     # The Community Hub: links reviewers have listed, and the recipes people settled on lately.
     write(os.path.join(out, "links.json"), build_links(root, log))
     write(os.path.join(out, "trending.json"), build_trending(root, min_contributors, log=log))
+
+    # The recipe book, and the coffees and recipes owners may review.
+    write(os.path.join(out, "recipes.json"), build_recipe_book(root, log))
+    write(os.path.join(out, "pending.json"), build_pending(root, log))
 
     # Subscription services reviewers have listed, and what their users think of them.
     write(os.path.join(out, "services.json"), build_services(root, min_contributors, log))

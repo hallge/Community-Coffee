@@ -29,6 +29,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sys
 
 # ---- P-256 ------------------------------------------------------------------
@@ -81,7 +82,10 @@ def ecdsa_verify(public, digest, r, s):
 
 
 # ---- records ----------------------------------------------------------------
-TYPES = ("key", "coffee", "grinder", "machine", "dialin", "shot", "taste", "service", "service_review", "link")
+TYPES = ("key", "coffee", "grinder", "machine", "dialin", "shot", "taste", "service", "service_review", "link",
+         "recipe", "review")
+# What an owner review points at: an item waiting under pending/, without ".json".
+REVIEW_TARGET = re.compile(r"(coffees/[0-9a-f]{20}/c|recipes/[0-9a-f]{20}/r)[0-9]{1,10}-[0-9]{1,10}")
 # A link suggested for the Community Hub (docs/COMMUNITY.md): what it is, and what it is about.
 LINK_KINDS = ("video", "playlist", "post", "guide", "article", "podcast")
 LINK_TOPICS = ("preparation", "dialing_in", "brewing", "beans", "gear", "milk", "maintenance", "science")
@@ -358,6 +362,24 @@ def check_body(body):
     elif kind == "link":
         # A video, post or guide an owner suggests for the Community Hub, for a reviewer.
         check_link(body)
+    elif kind == "recipe":
+        # A recipe for the recipe book: how the shot is pulled, nothing about the coffee or the owner.
+        recipe = body.get("recipe")
+        if not isinstance(recipe, dict):
+            raise Refused("recipe is missing")
+        _text(recipe, "name", 23)
+        check_recipe(recipe)
+        _text(recipe, "note", 119, required=False)
+        _number(body, "local_id", 1, 65535)
+        _number(body, "record", 0, 4294967295)
+    elif kind == "review":
+        # An owner's verdict on another owner's coffee or recipe waiting for review.
+        if not isinstance(body.get("target"), str) or not REVIEW_TARGET.fullmatch(body["target"]):
+            raise Refused("target is not an item waiting for review")
+        if body.get("verdict") not in ("approve", "decline"):
+            raise Refused("verdict is neither approve nor decline")
+        _text(body, "note", 119, required=body.get("verdict") == "decline")
+        _number(body, "record", 0, 4294967295)
     elif kind == "service_review":
         # How a drinker rated a listed service: stars and aspects. The drinker is a number, never a name.
         _number(body, "id", 1, 4294967295)
@@ -562,6 +584,19 @@ def self_test():
     assert "topics" in refused(envelope(link.replace('["dialing_in"]', '["cats"]')))
     assert "topics is missing" in refused(envelope(link.replace(',"topics":["dialing_in"]', '')))
     assert "kind" in refused(envelope(link.replace('"video"', '"meme"')))
+    # A recipe for the recipe book, and an owner's review.
+    recipe = ('{"t":"recipe","v":1,"record":9,"local_id":3,"recipe":{"name":"Turbo","dose_g":18,"yield_g":54,'
+              '"target_time_s":15}}')
+    assert verify(envelope(recipe), keys)[0] == "recipe"
+    assert "outside" in refused(envelope(recipe.replace('"dose_g":18', '"dose_g":80')))
+    assert "name is missing" in refused(envelope(recipe.replace('"name":"Turbo",', '')))
+    review = '{"t":"review","v":1,"record":10,"target":"coffees/0123456789abcdef0123/c4-7","verdict":"approve"}'
+    assert verify(envelope(review), keys)[0] == "review"
+    assert "note is missing" in refused(envelope(review.replace('"approve"', '"decline"')))
+    assert verify(envelope(review.replace('"approve"}', '"decline","note":"Not a real roaster"}')), keys)[0] == "review"
+    assert "target" in refused(envelope(review.replace("coffees/", "grinders/")))
+    assert "target" in refused(envelope(review.replace("c4-7", "c4-7/../x")))
+    assert "verdict" in refused(envelope(review.replace('"approve"', '"maybe"')))
     # A deleted rating, withdrawn: its id and nothing about the coffee or the drinker.
     withdrawn = '{"t":"taste","v":1,"id":42,"at":"2026-10-26T10:00:00Z","withdrawn":true}'
     assert verify(envelope(withdrawn), keys)[0] == "taste"

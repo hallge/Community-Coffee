@@ -43,6 +43,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -119,7 +120,75 @@ def set_status(library, kid, local_id, record, state, library_id="", note="", se
 
 
 STATUS_SECTIONS = {"coffee": "coffees", "grinder": "grinders", "machine": "machines", "service": "services",
-                   "link": "links"}
+                   "link": "links", "recipe": "recipes"}
+
+# Owner review: this many approvals from known good controllers (a key with something published), and no
+# decline, publish an item waiting for review. One decline holds it for a person.
+OWNER_APPROVALS = 2
+
+
+def key_published(library, kid):
+    """A known good controller: the library has published something it sent."""
+    status = read_json(os.path.join(library, "status", kid + ".json"), {}) or {}
+    if not isinstance(status, dict):
+        return False
+    return any(isinstance(e, dict) and e.get("state") == "published"
+               for section in status.values() if isinstance(section, list) for e in section)
+
+
+def reviews_path(target):
+    return os.path.join("pending", "reviews", target.replace("/", "_") + ".json")
+
+
+def owner_reviews(library, target):
+    """{reviewer kid: {"verdict", "note", "record"}} for an item waiting for review."""
+    data = read_json(os.path.join(library, reviews_path(target)), {}) or {}
+    reviews = data.get("reviews") if isinstance(data, dict) else None
+    return reviews if isinstance(reviews, dict) else {}
+
+
+def take_review(library, kid, body):
+    """An owner review. Returns (outcome, detail, plan item or None)."""
+    target = body["target"]
+    sender = target.split("/")[1]
+    if sender == kid:
+        return "refused", "a controller does not review what it sent", None
+    if not key_published(library, kid):
+        return "refused", "reviews count once something this controller sent has been published", None
+    if not os.path.exists(os.path.join(library, "pending", target + ".json")):
+        return "refused", "not waiting for review (published, declined or never sent)", None
+    reviews = owner_reviews(library, target)
+    earlier = reviews.get(kid)
+    if isinstance(earlier, dict) and earlier.get("record", -1) > body["record"]:
+        return "refused", "an earlier review, sent again since", None
+    note = "".join(c for c in (body.get("note") or "") if 0x20 <= ord(c) <= 0x7E)[:119].strip()
+    reviews[kid] = {"verdict": body["verdict"], "note": note, "record": body["record"]}
+    write_text(os.path.join(library, reviews_path(target)),
+               json.dumps({"target": target, "reviews": reviews}, indent=1, sort_keys=True) + "\n")
+    approvals = sum(1 for r in reviews.values() if r.get("verdict") == "approve")
+    declines = sum(1 for r in reviews.values() if r.get("verdict") == "decline")
+    letter_part = target.rsplit("/", 1)[1]
+    item = {"op": "owner_review", "branch": f"review/{sender}-{letter_part}", "target": target,
+            "verdict": body["verdict"], "note": note, "reviewer": kid, "approvals": approvals,
+            "declines": declines, "publish": approvals >= OWNER_APPROVALS and declines == 0}
+    return "filed", reviews_path(target).replace(os.sep, "/"), item
+
+
+def recipe_request_text(library, kid, body, proposed_id, exists):
+    recipe = body["recipe"]
+    rows = "\n".join(f"| {k.replace('_', ' ')} | {recipe[k]} |" for k in
+                     ("name", "dose_g", "yield_g", "target_time_s", "preinfusion_hold_s", "bloom_pause_s", "note")
+                     if k in recipe)
+    meta = json.dumps({"kind": "recipe", "kid": kid, "local_id": body["local_id"], "record": body["record"],
+                       "library_id": proposed_id}, separators=(",", ":"))
+    return "\n".join([
+        f"A controller has sent this recipe for the recipe book{' again, changed' if exists else ''}.",
+        "", "| | |", "| --- | --- |", rows, "",
+        f"**Would be published as** `recipes/{proposed_id}.json`" + (" (this entry exists: merging replaces it)" if exists else ""),
+        "",
+        f"Owners review it from their controllers: {OWNER_APPROVALS} approvals publish it, a decline holds it here.",
+        "- **Merge** to publish. **Close** to decline; a last comment starting `Declined:` is shown to the sender.",
+        "", f"<!-- intake {meta} -->"])
 
 
 def tell_refused(library, error):
@@ -332,6 +401,7 @@ def take(inbox, library, log=print):
     loaded.sort(key=order)
 
     plan, report = [], []
+    later = []   # owner reviews: after this batch's items are parked
     for path, text, problem, _ in loaded:
         shown = os.path.relpath(path, inbox).replace("\\", "/")
         if problem:
@@ -366,6 +436,27 @@ def take(inbox, library, log=print):
             target = f"svcreviews/{kid}-v{int(body['id'])}.json"
             write_text(os.path.join(library, target), text)
             report.append((shown, "filed", target))
+        elif kind == "review":
+            later.append((shown, kid, body))
+        elif kind == "recipe":   # for the recipe book: reviewed, like a coffee
+            local_id, record = body["local_id"], body["record"]
+            pending = f"pending/recipes/{kid}/r{local_id}-{record}.json"
+            if not set_status(library, kid, local_id, record, "review", section="recipes"):
+                report.append((shown, "refused", "an earlier version of a recipe that has been sent again since"))
+                continue
+            write_text(os.path.join(library, pending), text)
+            proposed = slug(body["recipe"]["name"]) or f"recipe-{digest}"
+            catalog_path = f"recipes/{proposed}.json"
+            exists = os.path.exists(os.path.join(library, catalog_path))
+            plan.append({
+                "branch": f"review/{kid}-r{local_id}-{record}",
+                "title": f"{'Change' if exists else 'Add'} recipe: {body['recipe']['name']}",
+                "body": recipe_request_text(library, kid, body, proposed, exists),
+                "catalog_path": catalog_path,
+                "catalog_text": json.dumps({"id": proposed, "recipe": body["recipe"]}, indent=1) + "\n",
+                "pending_path": pending,
+            })
+            report.append((shown, "for review", catalog_path))
         elif kind == "service":   # a subscription service for the shared list: reviewed, like a machine
             local_id, record = body["local_id"], body["record"]
             pending = f"pending/services/{kid}/s{local_id}-{record}.json"
@@ -473,6 +564,11 @@ def take(inbox, library, log=print):
                 "pending_path": pending,
             })
             report.append((shown, "for review", catalog_path))
+    for shown, kid, body in later:
+        outcome, detail, item = take_review(library, kid, body)
+        report.append((shown, outcome, detail))
+        if item:
+            plan.append(item)
     for shown, outcome, detail in report:
         log(f"{outcome:<10} {shown}  {detail}")
     return plan, report
@@ -666,6 +762,54 @@ def self_test():
         assert entry["topics"] == ["dialing_in", "brewing"] and "local_id" not in entry
         status = read_json(os.path.join(library, "status", anna[1] + ".json"))
         assert status["links"] == [{"local_id": 2, "record": 50, "state": "review"}]
+    # A recipe goes to review; owners review it: not their own, only once something of theirs is
+    # published, two approvals publish, a decline holds.
+    cara, dan = person(0x3333), person(0x4444)
+    recipe = {"t": "recipe", "v": 1, "record": 30, "local_id": 3, "at": "2026-10-29T10:00:00Z",
+              "recipe": {"name": "Turbo shot", "dose_g": 18, "yield_g": 54, "target_time_s": 15}}
+    with tempfile.TemporaryDirectory() as root:
+        inbox, library = os.path.join(root, "inbox"), os.path.join(root, "library")
+        os.makedirs(library)
+        for who in (anna, ben, cara, dan):
+            write_text(os.path.join(inbox, f"k{who[1]}.json"),
+                       bi._envelope(who[0], who[1], {"t": "key", "v": 1, "alg": "ES256", "key": who[2]}))
+        write_text(os.path.join(inbox, "r.json"), bi._envelope(anna[0], anna[1], recipe))
+        plan, report = take(inbox, library, log=lambda *_: None)
+        outcome = {name: (what, detail) for name, what, detail in report}
+        assert outcome["r.json"] == ("for review", "recipes/turbo-shot.json")
+        rplan = [p for p in plan if p.get("branch") == f"review/{anna[1]}-r3-30"][0]
+        assert rplan["title"] == "Add recipe: Turbo shot" and '"kind":"recipe"' in rplan["body"]
+        assert json.loads(rplan["catalog_text"]) == {"id": "turbo-shot", "recipe": recipe["recipe"]}
+        target = f"recipes/{anna[1]}/r3-30"
+        assert read_json(os.path.join(library, "status", anna[1] + ".json"))["recipes"][0]["state"] == "review"
+        # Ben and Cara have something published; Dan has not.
+        for who in (ben, cara):
+            set_status(library, who[1], 1, 1, "published", "x/y")
+
+        def review(who, verdict, record, note=""):
+            body = {"t": "review", "v": 1, "record": record, "target": target, "verdict": verdict}
+            if note:
+                body["note"] = note
+            shutil.rmtree(inbox, ignore_errors=True)
+            write_text(os.path.join(inbox, "o.json"), bi._envelope(who[0], who[1], body))
+            plan, report = take(inbox, library, log=lambda *_: None)
+            return report[0][1], report[0][2], (plan[0] if plan else None)
+
+        assert review(anna, "approve", 31)[0] == "refused"                    # her own
+        assert "published" in review(dan, "approve", 32)[1]                    # nothing of his published
+        what, _, item = review(ben, "approve", 33)
+        assert what == "filed" and item["approvals"] == 1 and not item["publish"]
+        assert item["branch"] == f"review/{anna[1]}-r3-30"
+        what, _, item = review(ben, "approve", 34)                             # the same reviewer again: still one
+        assert item["approvals"] == 1 and not item["publish"]
+        what, _, item = review(cara, "approve", 35)
+        assert item["approvals"] == 2 and item["publish"]
+        what, _, item = review(cara, "decline", 36, "Too long for a turbo")    # changed her mind: holds
+        assert item["approvals"] == 1 and item["declines"] == 1 and not item["publish"]
+        assert item["note"] == "Too long for a turbo"
+        assert review(ben, "approve", 33)[0] == "refused"                      # older than his last
+        os.remove(os.path.join(library, "pending", "recipes", anna[1], "r3-30.json"))
+        assert "not waiting" in review(cara, "approve", 37)[1]                 # decided already
     print("self-test passed")
 
 
